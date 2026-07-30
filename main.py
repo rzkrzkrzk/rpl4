@@ -296,6 +296,22 @@ async def rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {display_name} — {goals}/{attempts} ({percent}%)\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+# ---------- Команда для запуска дуэли в чатах ----------
+async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /duelrpl – запускает игру в любом чате."""
+    # Если команда вызвана в личке, можно использовать ту же логику
+    # Отправляем сообщение с клавиатурой и переходим в состояние ожидания выбора
+    await update.message.reply_text(
+        "🏒 **Дуэль Буллитов!**\n"
+        "Выбери зону для броска:",
+        parse_mode="Markdown",
+        reply_markup=duel_shot_keyboard()
+    )
+    # Устанавливаем флаг, что мы в диалоге (для автоудаления)
+    context.user_data["in_conversation"] = True
+    return WAITING_DUEL_SHOT
+
+# ---------- Inline-колбэки ----------
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -377,13 +393,16 @@ async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ Не удалось отправить GIF. Проверьте настройки.")
         logger.error(f"Ошибка отправки GIF: {e}")
 
+    # Возвращаем в главное меню или просто предлагаем сыграть ещё
+    # В группах лучше не показывать главное меню, а просто предложить новую игру
     await query.message.reply_text(
-        "📌 Выберите другой раздел:",
-        reply_markup=welcome_inline_keyboard()
+        "📌 Сыграйте ещё раз, написав /duelrpl или выберите другой раздел:",
+        reply_markup=welcome_inline_keyboard() if update.effective_chat.type == "private" else None
     )
     context.user_data["in_conversation"] = False
     return ConversationHandler.END
 
+# ---------- Поддержка ----------
 async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
@@ -433,6 +452,7 @@ async def support_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+# ---------- Админ-панель ----------
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Команда только в личных сообщениях.")
@@ -505,6 +525,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     return ConversationHandler.END
 
+# ---------- Добавление каналов и чатов ----------
 async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.strip()
     if not username.startswith('@'):
@@ -571,6 +592,7 @@ async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["in_conversation"] = False
     return ConversationHandler.END
 
+# ---------- Просмотр поддержки и настроек ----------
 async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = get_unanswered_messages()
     if not messages:
@@ -609,6 +631,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "  (нет)\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
 
+# ---------- Настройки игры ----------
 async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     goal_gif = get_config('gif_goal') or 'не установлен'
@@ -773,6 +796,7 @@ async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["in_conversation"] = False
     return ConversationHandler.END
 
+# ---------- Пересылка из каналов ----------
 async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_post = update.channel_post
     if not channel_post:
@@ -795,6 +819,7 @@ async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.error(f"Ошибка пересылки в {target_id}: {e}")
 
+# ---------- Автоудаление неизвестных сообщений ----------
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
@@ -879,8 +904,12 @@ def main():
     )
     app.add_handler(conv_support)
 
+    # Диалог дуэли – теперь с двумя entry points: inline-кнопка и команда /duelrpl
     conv_duel = ConversationHandler(
-        entry_points=[CallbackQueryHandler(inline_callback, pattern="^duel$")],
+        entry_points=[
+            CallbackQueryHandler(inline_callback, pattern="^duel$"),
+            CommandHandler("duelrpl", duel_command)
+        ],
         states={
             WAITING_DUEL_SHOT: [CallbackQueryHandler(duel_shot, pattern="^shot_")],
         },
@@ -922,14 +951,14 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🚪 Выйти$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$") & filters.ChatType.PRIVATE, main_menu))
 
-    # Inline колбэки
+    # Inline колбэки (кроме duel, который уже в диалоге)
     app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website)$"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(close_|next_support|back_to_admin|view_goal_gif|view_save_gif)$"))
 
     # Пересылка из каналов
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
 
-    # Автоудаление
+    # Автоудаление неизвестных сообщений
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_unknown_message), group=999)
 
     # Команды
