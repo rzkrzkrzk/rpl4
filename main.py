@@ -647,14 +647,12 @@ async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE)
          InlineKeyboardButton("🔄 Изменить GIF сейва", callback_data="change_save_gif")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
     ])
-    # Отправляем сообщение в зависимости от типа update
     if update.message:
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
     elif update.callback_query:
         await update.callback_query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
     else:
         logger.error("show_game_settings: нет ни message, ни callback_query")
-        # пробуем через бота отправить админу (запасной вариант)
         await context.bot.send_message(chat_id=update.effective_user.id, text=text, parse_mode="Markdown", reply_markup=keyboard)
 
 async def view_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
@@ -676,8 +674,7 @@ async def change_gif_start(update: Update, context: ContextTypes.DEFAULT_TYPE, g
     context.user_data["gif_type"] = gif_type
     context.user_data["in_conversation"] = True
     await query.edit_message_text(
-        f"📤 Отправьте **GIF-файл** для {'гола' if gif_type == 'goal' else 'сейва'}.\n"
-        "Просто перешлите GIF или загрузите файл.\n"
+        f"📤 Отправьте **GIF-файл** (анимацию или документ) или **прямую ссылку** (текстом) для {'гола' if gif_type == 'goal' else 'сейва'}.\n"
         "Для отмены отправьте /cancel"
     )
     if gif_type == 'goal':
@@ -686,15 +683,24 @@ async def change_gif_start(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         return WAITING_GIF_SAVE
 
 async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
-    """Обработчик получения GIF-файла от администратора."""
+    """Обработчик получения GIF-файла или прямой ссылки от администратора."""
     message = update.message
     file_id = None
-    if message.animation:
+    text = message.text or ""
+
+    # 1. Если прислана ссылка (текст, начинающийся с http)
+    if text and (text.startswith('http://') or text.startswith('https://')):
+        file_id = text
+    # 2. Если это анимация
+    elif message.animation:
         file_id = message.animation.file_id
+    # 3. Если это документ с MIME-типом gif
     elif message.document and message.document.mime_type and 'gif' in message.document.mime_type:
         file_id = message.document.file_id
     else:
-        await update.message.reply_text("❌ Пожалуйста, отправьте GIF-файл (анимацию или документ).")
+        await update.message.reply_text(
+            "❌ Пожалуйста, отправьте **GIF-файл** (анимацию, документ) или **прямую ссылку** на GIF."
+        )
         return WAITING_GIF_GOAL if gif_type == 'goal' else WAITING_GIF_SAVE
 
     if file_id:
@@ -933,8 +939,8 @@ def main():
         entry_points=[CallbackQueryHandler(admin_callback, pattern="^change_goal_gif$")],
         states={
             WAITING_GIF_GOAL: [
-                MessageHandler(filters.ANIMATION | filters.Document.ALL, lambda u,c: receive_gif(u,c,'goal')),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, cancel_gif_dialog)
+                MessageHandler(filters.ANIMATION | filters.Document.ALL | filters.TEXT, lambda u,c: receive_gif(u,c,'goal')),
+                # Если пользователь прислал не GIF и не ссылку, сработает fallback
             ],
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
@@ -946,8 +952,7 @@ def main():
         entry_points=[CallbackQueryHandler(admin_callback, pattern="^change_save_gif$")],
         states={
             WAITING_GIF_SAVE: [
-                MessageHandler(filters.ANIMATION | filters.Document.ALL, lambda u,c: receive_gif(u,c,'save')),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, cancel_gif_dialog)
+                MessageHandler(filters.ANIMATION | filters.Document.ALL | filters.TEXT, lambda u,c: receive_gif(u,c,'save')),
             ],
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
