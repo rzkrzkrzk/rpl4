@@ -211,7 +211,6 @@ def check_credentials(login, password):
 def update_player_stats(user_id, username, scored):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Исправлен запрос: правильное количество параметров и значения
     c.execute('''
         INSERT INTO player_stats (user_id, username, attempts, goals)
         VALUES (?, ?, 1, ?)
@@ -286,7 +285,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=welcome_inline_keyboard()
     )
 
-# ---------- Рейтинг с эмодзи для первых трёх мест (ИСПРАВЛЕНО) ----------
+# ---------- Рейтинг с эмодзи для первых трёх мест ----------
 async def rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top = get_top_players(limit=10, min_attempts=3)
     if not top:
@@ -629,8 +628,9 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "  (нет)\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
 
-# ---------- Настройки игры ----------
+# ---------- Настройки игры (ИСПРАВЛЕНО) ----------
 async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущие настройки игры с инлайн-кнопками."""
     context.user_data.clear()
     goal_gif = get_config('gif_goal') or 'не установлен'
     save_gif = get_config('gif_save') or 'не установлен'
@@ -647,7 +647,15 @@ async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE)
          InlineKeyboardButton("🔄 Изменить GIF сейва", callback_data="change_save_gif")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
     ])
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    # Отправляем сообщение в зависимости от типа update
+    if update.message:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    else:
+        logger.error("show_game_settings: нет ни message, ни callback_query")
+        # пробуем через бота отправить админу (запасной вариант)
+        await context.bot.send_message(chat_id=update.effective_user.id, text=text, parse_mode="Markdown", reply_markup=keyboard)
 
 async def view_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
     query = update.callback_query
@@ -678,6 +686,7 @@ async def change_gif_start(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         return WAITING_GIF_SAVE
 
 async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
+    """Обработчик получения GIF-файла от администратора."""
     message = update.message
     file_id = None
     if message.animation:
@@ -692,8 +701,13 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_ty
         key = 'gif_goal' if gif_type == 'goal' else 'gif_save'
         set_config(key, file_id)
         await update.message.reply_text("✅ GIF сохранён!", reply_markup=admin_menu_keyboard())
+        # Показываем обновлённые настройки игры
+        try:
+            await show_game_settings(update, context)
+        except Exception as e:
+            logger.error(f"Ошибка при показе настроек игры: {e}")
+            await update.message.reply_text("⚠️ Не удалось отобразить настройки, но GIF сохранён.")
         context.user_data.clear()
-        await show_game_settings(update, context)
         return ConversationHandler.END
     else:
         await update.message.reply_text("❌ Не удалось получить file_id. Попробуйте ещё раз.")
@@ -902,7 +916,6 @@ def main():
     )
     app.add_handler(conv_support)
 
-    # Диалог дуэли – теперь с двумя entry points: inline-кнопка и команда /duelrpl
     conv_duel = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(inline_callback, pattern="^duel$"),
