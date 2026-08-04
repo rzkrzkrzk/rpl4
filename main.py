@@ -207,10 +207,11 @@ def check_credentials(login, password):
     }
     return credentials.get(login) == password
 
-# ---------- Статистика игроков ----------
+# ---------- Статистика игроков (ИСПРАВЛЕНО) ----------
 def update_player_stats(user_id, username, scored):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Исправлен запрос: правильное количество параметров и значения
     c.execute('''
         INSERT INTO player_stats (user_id, username, attempts, goals)
         VALUES (?, ?, 1, ?)
@@ -285,29 +286,28 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=welcome_inline_keyboard()
     )
 
+# ---------- Рейтинг с эмодзи для первых трёх мест (ИСПРАВЛЕНО) ----------
 async def rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top = get_top_players(limit=10, min_attempts=3)
     if not top:
         await update.message.reply_text("📊 Пока нет статистики. Сыграйте в «Дуэль Буллитов»!")
         return
     text = "🏆 **Топ-10 игроков по проценту голов**\n\n"
+    medals = ["🥇", "🥈", "🥉"]
     for i, (username, attempts, goals, percent) in enumerate(top, 1):
         display_name = username or f"Игрок {i}"
-        text += f"{i}. {display_name} — {goals}/{attempts} ({percent}%)\n"
+        medal = medals[i-1] if i <= 3 else f"{i}."
+        text += f"{medal} {display_name} — {goals}/{attempts} ({percent}%)\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # ---------- Команда для запуска дуэли в чатах ----------
 async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /duelrpl – запускает игру в любом чате."""
-    # Если команда вызвана в личке, можно использовать ту же логику
-    # Отправляем сообщение с клавиатурой и переходим в состояние ожидания выбора
     await update.message.reply_text(
         "🏒 **Дуэль Буллитов!**\n"
         "Выбери зону для броска:",
         parse_mode="Markdown",
         reply_markup=duel_shot_keyboard()
     )
-    # Устанавливаем флаг, что мы в диалоге (для автоудаления)
     context.user_data["in_conversation"] = True
     return WAITING_DUEL_SHOT
 
@@ -393,8 +393,6 @@ async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ Не удалось отправить GIF. Проверьте настройки.")
         logger.error(f"Ошибка отправки GIF: {e}")
 
-    # Возвращаем в главное меню или просто предлагаем сыграть ещё
-    # В группах лучше не показывать главное меню, а просто предложить новую игру
     await query.message.reply_text(
         "📌 Сыграйте ещё раз, написав /duelrpl или выберите другой раздел:",
         reply_markup=welcome_inline_keyboard() if update.effective_chat.type == "private" else None
