@@ -198,7 +198,7 @@ def admin_reply_keyboard():
 def card_admin_reply_keyboard():
     return ReplyKeyboardMarkup([
         ["📁 Создать коллекцию", "➕ Добавить карточку"],
-        ["🎁 Выдать карточку игроку", "⬅️ Выйти в меню админки"]
+        ["🎁 Выдать карточку игроку", "⬅️ Выйти из настройки карточек"]
     ], resize_keyboard=True)
 
 def inventory_inline_keyboard(cards):
@@ -311,7 +311,6 @@ async def show_or_update_inventory(update: Update, context: ContextTypes.DEFAULT
         try:
             await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
         except Exception:
-            # Если сообщение содержало фото или не изменилось текст
             await query.message.delete()
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=markup, parse_mode="Markdown")
     else:
@@ -384,7 +383,7 @@ async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         card_id = int(data.split("_")[2])
         conn = get_db_connection()
         c = conn.cursor(cursor_factory=RealDictCursor)
-        # Проверяем количество мифической карточки
+
         c.execute("SELECT quantity, c.collection_id FROM user_cards uc JOIN cards c ON uc.card_id = c.card_id WHERE uc.user_id = %s AND uc.card_id = %s", (user.id, card_id))
         res = c.fetchone()
         
@@ -394,7 +393,6 @@ async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         col_id = res['collection_id']
-        # Ищем легендарную карточку в этой же коллекции
         c.execute("SELECT card_id, name, image_file_id FROM cards WHERE collection_id = %s AND rarity = 'Легендарная' LIMIT 1", (col_id,))
         leg_card = c.fetchone()
 
@@ -403,21 +401,18 @@ async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ В этой коллекции еще не создана легендарная карточка!", show_alert=True)
             return
 
-        # Списываем 5 мифических и добавляем 1 легендарную
         c_write = conn.cursor()
         c_write.execute("UPDATE user_cards SET quantity = quantity - 5 WHERE user_id = %s AND card_id = %s", (user.id, card_id))
         c_write.execute("""
             INSERT INTO user_cards (user_id, card_id, quantity) VALUES (%s, %s, 1)
             ON CONFLICT (user_id, card_id) DO UPDATE SET quantity = user_cards.quantity + 1
         """, (user.id, leg_card['card_id']))
-        # Удаляем запись если количество стало 0
         c_write.execute("DELETE FROM user_cards WHERE user_id = %s AND card_id = %s AND quantity <= 0", (user.id, card_id))
         conn.commit()
         conn.close()
 
         await query.answer("🎉 Успешный крафт легендарной карточки!", show_alert=True)
         
-        # Удаляем старое инвентарное сообщение и шлем новую карточку
         try:
             await query.message.delete()
         except Exception:
@@ -429,7 +424,6 @@ async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await context.bot.send_message(chat_id=user.id, text=congrats_text, parse_mode="Markdown")
 
-        # Открываем обновленный инвентарь новым сообщением
         await show_or_update_inventory(update, context, is_new=True)
 
     elif data.startswith("select_match_"):
@@ -585,7 +579,7 @@ async def admin_buttons_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("🎁 Введите `@username ID_карточки` (например: `@player 5`):", parse_mode="Markdown")
         return GRANT_CARD_INPUT
 
-    elif text == "⬅️ Выйти в меню админки":
+    elif text == "⬅️ Выйти из настройки карточек":
         await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_reply_keyboard())
 
 # --- Управление карточками (Админка) ---
@@ -952,9 +946,9 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_match_callback, pattern="^(adm_|settle_)"))
     app.add_handler(CallbackQueryHandler(user_callback_handler))
 
-    app.add_handler(MessageHandler(filters.Regex("^(❌ Удалить/Завершить матч|🚪 Выйти с админки|🃏 Карточки|⬅️ Выйти в меню админки)$"), admin_buttons_handler))
+    app.add_handler(MessageHandler(filters.Regex("^(❌ Удалить/Завершить матч|🚪 Выйти с админки|🃏 Карточки|⬅️ Выйти из настройки карточек)$"), admin_buttons_handler))
 
-    logger.info("Бот запущен с PostgreSQL и системой карточек...")
+    logger.info("Бот запущен с PostgreSQL...")
     app.run_polling()
 
 if __name__ == "__main__":
