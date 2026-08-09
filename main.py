@@ -4,7 +4,7 @@ import sqlite3
 import asyncio
 import random
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,17 +25,10 @@ if not TOKEN:
 DB_PATH = "bot_data.db"
 ADMIN_SESSION_MINUTES = 30
 
-WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, WAITING_CHAT_LINK, WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG = range(6)
-WAITING_DUEL_SHOT = 10
-WAITING_GIF_GOAL = 11
-WAITING_GIF_SAVE = 12
-WAITING_CARD_RARITY = 13
-WAITING_CARD_COLLECTION = 14
-WAITING_CARD_NAME = 15
-WAITING_CARD_IMAGE = 16
-WAITING_CARD_ID_TO_GIVE = 17
-WAITING_USER_ID_TO_GIVE = 18
-WAITING_NEW_COLLECTION_NAME = 19
+(WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, WAITING_CHAT_LINK, 
+ WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG, WAITING_DUEL_SHOT, WAITING_GIF_GOAL, 
+ WAITING_GIF_SAVE, CARD_ADMIN_MENU, ADD_COLLECTION_NAME, ADD_CARD_RARITY, 
+ ADD_CARD_COLLECTION, ADD_CARD_NAME, ADD_CARD_PHOTO, GRANT_CARD_PLAYER) = range(16)
 
 # ---------- БД ----------
 def init_db():
@@ -87,9 +80,7 @@ def init_db():
             goals INTEGER DEFAULT 0
         )
     ''')
-    c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_goal', ''))
-    c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_save', ''))
-
+    # Системы карточек
     c.execute('''
         CREATE TABLE IF NOT EXISTS collections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,32 +91,34 @@ def init_db():
         CREATE TABLE IF NOT EXISTS cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             collection_id INTEGER,
-            rarity TEXT,
             name TEXT,
-            image_file_id TEXT,
-            FOREIGN KEY (collection_id) REFERENCES collections(id)
+            rarity TEXT,
+            image_id TEXT,
+            FOREIGN KEY(collection_id) REFERENCES collections(id)
         )
     ''')
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_cards (
             user_id INTEGER,
             card_id INTEGER,
-            quantity INTEGER DEFAULT 1,
-            PRIMARY KEY (user_id, card_id)
+            count INTEGER DEFAULT 1,
+            PRIMARY KEY(user_id, card_id)
         )
     ''')
     c.execute('''
-        CREATE TABLE IF NOT EXISTS user_last_free (
+        CREATE TABLE IF NOT EXISTS card_claims (
             user_id INTEGER PRIMARY KEY,
-            last_time INTEGER
+            last_claim TIMESTAMP
         )
     ''')
+    c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_goal', ''))
+    c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_save', ''))
     conn.commit()
     conn.close()
 
 init_db()
 
-# ---------- Функции БД (существующие) ----------
+# ---------- Функции БД ----------
 def get_config(key):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -245,6 +238,7 @@ def check_credentials(login, password):
     }
     return credentials.get(login) == password
 
+# ---------- Статистика игроков ----------
 def update_player_stats(user_id, username, scored):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -274,189 +268,162 @@ def get_top_players(limit=10, min_attempts=3):
     conn.close()
     return rows
 
-# ---------- Функции для карточек ----------
-def create_collection(name):
+# ---------- Логика карточек ----------
+async def freegoyda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    try:
-        c.execute('INSERT INTO collections (name) VALUES (?)', (name,))
+    
+    # Проверка КД (24 часа)
+    c.execute("SELECT last_claim FROM card_claims WHERE user_id = ?", (user.id,))
+    row = c.fetchone()
+    now = datetime.now()
+    if row:
+        last_claim = datetime.fromisoformat(row[0])
+        if now < last_claim + timedelta(hours=24):
+            wait_time = (last_claim + timedelta(hours=24)) - now
+            hours, remainder = divmod(wait_time.seconds, 3600)
+            minutes = remainder // 60
+            await update.message.reply_text(f"⏳ Слишком рано! Новую карточку можно будет получить через {hours} ч. {minutes} мин.")
+            conn.close()
+            return
+
+    # Выпадение по редкостям: Редкая, Очень редкая, Эпическая, Мифическая
+    rarity = random.choices(
+        ["Редкая", "Очень редкая", "Эпическая", "Мифическая"],
+        weights=[55, 30, 12, 3], k=1
+    )[0]
+    
+    c.execute('''
+        SELECT cards.id, cards.name, collections.name, cards.image_id 
+        FROM cards 
+        JOIN collections ON cards.collection_id = collections.id 
+        WHERE cards.rarity = ?
+    ''', (rarity,))
+    available = c.fetchall()
+    
+    if not available:
+        await update.message.reply_text("📭 В игре пока нет карточек для выпадения. Администратор скоро их добавит!")
+        conn.close()
+        return
+
+    card = random.choice(available)
+    card_id, c_name, col_name, img_id = card
+    
+    # Сохраняем клейм и выдаем карточку
+    c.execute("INSERT OR REPLACE INTO card_claims (user_id, last_claim) VALUES (?, ?)", (user.id, now.isoformat()))
+    c.execute('''
+        INSERT INTO user_cards (user_id, card_id, count) VALUES (?, ?, 1)
+        ON CONFLICT(user_id, card_id) DO UPDATE SET count = count + 1
+    ''', (user.id, card_id))
+    conn.commit()
+    conn.close()
+
+    text = f"✨ **Новая карточка!**\n\n🏷 Название: {c_name}\n🌟 Редкость: {rarity}\n📁 Коллекция: {col_name}"
+    if img_id:
+        await update.message.reply_photo(img_id, caption=text, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    # Если вызов из инлайн-кнопки крафта, подчищаем старое сообщение
+    if update.callback_query:
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        SELECT cards.name, cards.rarity, collections.name, user_cards.count, cards.id, collections.id 
+        FROM user_cards 
+        JOIN cards ON user_cards.card_id = cards.id 
+        JOIN collections ON cards.collection_id = collections.id 
+        WHERE user_id = ?
+        ORDER BY collections.name, cards.rarity
+    ''', (user.id,))
+    cards = c.fetchall()
+    conn.close()
+
+    if not cards:
+        msg = "🎒 Твой инвентарь пуст. Используй команду /freegoyda, чтобы получить первую карточку!"
+        if update.callback_query:
+            await update.callback_query.message.reply_text(msg)
+        else:
+            await update.message.reply_text(msg)
+        return
+
+    text = "🎒 **Твой инвентарь карточек:**\n\n"
+    buttons = []
+    
+    for name, rarity, col, count, cid, col_id in cards:
+        text += f"▪️ [{rarity}] **{name}** ({col}) — `{count} шт.`\n"
+        # Кнопка крафта Легендарной (требуется 5 мифических одной коллекции)
+        if rarity == "Мифическая" and count >= 5:
+            buttons.append([InlineKeyboardButton(f"🔨 Скрафтить Легендарную ({col})", callback_data=f"craft_{cid}_{col_id}")])
+
+    buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_inventory")])
+    markup = InlineKeyboardMarkup(buttons)
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+
+async def inventory_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if data == "refresh_inventory":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await inventory(update, context)
+        return
+
+    if data.startswith("craft_"):
+        _, card_id, col_id = data.split("_")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Проверяем количество мифических
+        c.execute("SELECT count FROM user_cards WHERE user_id = ? AND card_id = ?", (user_id, card_id))
+        res = c.fetchone()
+        if not res or res[0] < 5:
+            await query.answer("❌ У тебя недостаточно мифических карточек для крафта (нужно 5 штук)!", show_alert=True)
+            conn.close()
+            return
+
+        # Ищем Легендарную карточку в этой же коллекции
+        c.execute("SELECT id, name FROM cards WHERE collection_id = ? AND rarity = 'Легендарная' LIMIT 1", (col_id,))
+        leg = c.fetchone()
+        if not leg:
+            await query.answer("❌ В этой коллекции еще не добавлена легендарная карточка!", show_alert=True)
+            conn.close()
+            return
+
+        # Списание 5 мифических и выдача 1 легендарной
+        c.execute("UPDATE user_cards SET count = count - 5 WHERE user_id = ? AND card_id = ?", (user_id, card_id))
+        c.execute("DELETE FROM user_cards WHERE count <= 0")
+        c.execute('''
+            INSERT INTO user_cards (user_id, card_id, count) VALUES (?, ?, 1)
+            ON CONFLICT(user_id, card_id) DO UPDATE SET count = count + 1
+        ''', (user_id, leg[0]))
         conn.commit()
-        return c.lastrowid
-    except sqlite3.IntegrityError:
-        return None
-    finally:
         conn.close()
 
-def get_collections():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, name FROM collections')
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_collection_id(name):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id FROM collections WHERE name = ?', (name,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def add_card(collection_id, rarity, name, image_file_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO cards (collection_id, rarity, name, image_file_id) VALUES (?, ?, ?, ?)',
-              (collection_id, rarity, name, image_file_id))
-    conn.commit()
-    card_id = c.lastrowid
-    conn.close()
-    return card_id
-
-def get_card(card_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, collection_id, rarity, name, image_file_id FROM cards WHERE id = ?', (card_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-def get_all_cards():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, collection_id, rarity, name, image_file_id FROM cards')
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_cards_by_rarity(rarity):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, collection_id, name, image_file_id FROM cards WHERE rarity = ?', (rarity,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_cards_by_collection_and_rarity(collection_id, rarity):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, name, image_file_id FROM cards WHERE collection_id = ? AND rarity = ?', (collection_id, rarity))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def give_card_to_user(user_id, card_id, quantity=1):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO user_cards (user_id, card_id, quantity)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, card_id) DO UPDATE SET
-            quantity = quantity + ?
-    ''', (user_id, card_id, quantity, quantity))
-    conn.commit()
-    conn.close()
-
-def get_user_cards(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        SELECT c.id, c.collection_id, col.name, c.rarity, c.name, c.image_file_id, uc.quantity
-        FROM user_cards uc
-        JOIN cards c ON uc.card_id = c.id
-        JOIN collections col ON c.collection_id = col.id
-        WHERE uc.user_id = ?
-    ''', (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_user_cards_by_collection(user_id):
-    rows = get_user_cards(user_id)
-    result = {}
-    for row in rows:
-        card_id, coll_id, coll_name, rarity, card_name, image_file_id, quantity = row
-        if coll_name not in result:
-            result[coll_name] = []
-        result[coll_name].append((card_id, rarity, card_name, quantity, image_file_id))
-    return result
-
-def get_user_last_free(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT last_time FROM user_last_free WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-def set_user_last_free(user_id, timestamp):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO user_last_free (user_id, last_time) VALUES (?, ?)', (user_id, timestamp))
-    conn.commit()
-    conn.close()
-
-def get_mythical_count_by_collection(user_id, collection_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        SELECT SUM(uc.quantity)
-        FROM user_cards uc
-        JOIN cards c ON uc.card_id = c.id
-        WHERE uc.user_id = ? AND c.collection_id = ? AND c.rarity = 'Мифическая'
-    ''', (user_id, collection_id))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row[0] else 0
-
-def get_legendary_card_for_collection(collection_id):
-    cards = get_cards_by_collection_and_rarity(collection_id, 'Легендарная')
-    if cards:
-        return random.choice(cards)
-    return None
-
-def deduct_user_cards(user_id, card_id, quantity):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE user_cards SET quantity = quantity - ? WHERE user_id = ? AND card_id = ?', (quantity, user_id, card_id))
-    c.execute('DELETE FROM user_cards WHERE user_id = ? AND card_id = ? AND quantity <= 0', (user_id, card_id))
-    conn.commit()
-    conn.close()
-
-def craft_legendary(user_id, collection_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        SELECT uc.card_id, uc.quantity
-        FROM user_cards uc
-        JOIN cards c ON uc.card_id = c.id
-        WHERE uc.user_id = ? AND c.collection_id = ? AND c.rarity = 'Мифическая'
-    ''', (user_id, collection_id))
-    rows = c.fetchall()
-    conn.close()
-
-    if not rows:
-        return False, "Нет мифических карт в этой коллекции."
-
-    total = sum(q for _, q in rows)
-    if total < 5:
-        return False, f"Недостаточно мифических карт. Есть {total}, нужно 5."
-
-    to_deduct = 5
-    for card_id, qty in rows:
-        if to_deduct <= 0:
-            break
-        deduct_now = min(qty, to_deduct)
-        deduct_user_cards(user_id, card_id, deduct_now)
-        to_deduct -= deduct_now
-
-    legendary = get_legendary_card_for_collection(collection_id)
-    if not legendary:
-        return False, "В этой коллекции нет легендарной карты. Обратитесь к администратору."
-
-    leg_card_id, leg_name, leg_image = legendary
-    give_card_to_user(user_id, leg_card_id, 1)
-    return True, f"Вы скрафтили легендарную карту «{leg_name}»!"
+        await query.answer("🎉 Успешный крафт легендарной карточки!", show_alert=True)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await update.effective_message.reply_text(f"👑 Поздравляем! Ты успешно скрафтил легендарную карточку: **{leg[1]}**!", parse_mode="Markdown")
+        await inventory(update, context)
 
 # ---------- Клавиатуры ----------
 def main_menu_keyboard():
@@ -470,10 +437,10 @@ def admin_menu_keyboard():
         ["🚪 Выйти"]
     ], resize_keyboard=True)
 
-def cards_admin_menu_keyboard():
+def card_admin_keyboard():
     return ReplyKeyboardMarkup([
-        ["➕ Создать коллекцию", "🆕 Добавить карточку"],
-        ["🎁 Выдать карточку игроку", "🔙 Назад в админ-панель"]
+        ["📁 Создать коллекцию", "🃏 Добавить карточку"],
+        ["🎁 Выдать карточку игроку", "🔙 Назад в админку"]
     ], resize_keyboard=True)
 
 def welcome_inline_keyboard():
@@ -481,8 +448,7 @@ def welcome_inline_keyboard():
         [InlineKeyboardButton("💬 Наш Discord", callback_data="discord")],
         [InlineKeyboardButton("🌐 Наш Сайт", callback_data="website")],
         [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data="support")],
-        [InlineKeyboardButton("🏒 Дуэль Буллитов", callback_data="duel")],
-        [InlineKeyboardButton("🃏 Получить карточку", callback_data="free_card")]
+        [InlineKeyboardButton("🏒 Дуэль Буллитов", callback_data="duel")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -535,147 +501,6 @@ async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["in_conversation"] = True
     return WAITING_DUEL_SHOT
 
-async def free_card_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    last_time = get_user_last_free(user_id)
-    now = int(datetime.now().timestamp())
-    if last_time and (now - last_time) < 86400:
-        remaining = 86400 - (now - last_time)
-        hours = remaining // 3600
-        minutes = (remaining % 3600) // 60
-        await update.message.reply_text(f"⏳ Вы уже получали карточку сегодня. Подождите {hours} ч {minutes} мин.")
-        return
-
-    rarity_pool = [
-        ('Редкая', 0.50),
-        ('Очень редкая', 0.25),
-        ('Эпическая', 0.15),
-        ('Мифическая', 0.10)
-    ]
-    rarities = [r for r, _ in rarity_pool]
-    weights = [w for _, w in rarity_pool]
-    chosen_rarity = random.choices(rarities, weights=weights, k=1)[0]
-
-    cards = get_cards_by_rarity(chosen_rarity)
-    if not cards:
-        await update.message.reply_text("😕 К сожалению, карточек этой редкости пока нет. Попробуйте позже.")
-        return
-
-    card = random.choice(cards)
-    card_id, collection_id, card_name, image_file_id = card
-
-    give_card_to_user(user_id, card_id, 1)
-    set_user_last_free(user_id, now)
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT name FROM collections WHERE id = ?', (collection_id,))
-    coll_row = c.fetchone()
-    conn.close()
-    collection_name = coll_row[0] if coll_row else "Неизвестная"
-
-    caption = (
-        f"🃏 **Новая карточка!**\n\n"
-        f"📛 **Название:** {card_name}\n"
-        f"⭐ **Редкость:** {chosen_rarity}\n"
-        f"📚 **Коллекция:** {collection_name}"
-    )
-    try:
-        await update.message.reply_animation(image_file_id, caption=caption, parse_mode="Markdown")
-    except Exception:
-        try:
-            await update.message.reply_photo(image_file_id, caption=caption, parse_mode="Markdown")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Не удалось отправить изображение карточки. Ошибка: {e}")
-            logger.error(f"Ошибка отправки карточки: {e}")
-
-async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_cards = get_user_cards_by_collection(user_id)
-
-    if not user_cards:
-        await update.message.reply_text("📭 У вас пока нет карточек. Используйте /freegoyda, чтобы получить первую!")
-        return
-
-    text = "🎒 **Ваш инвентарь карточек:**\n\n"
-    keyboard_buttons = []
-
-    for collection, cards in user_cards.items():
-        text += f"📚 **{collection}**\n"
-        rarity_groups = {}
-        for card_id, rarity, card_name, qty, img in cards:
-            if rarity not in rarity_groups:
-                rarity_groups[rarity] = []
-            rarity_groups[rarity].append((card_name, qty))
-        for rarity, items in rarity_groups.items():
-            text += f"  {rarity}:\n"
-            for name, qty in items:
-                text += f"    • {name} ×{qty}\n"
-        text += "\n"
-
-        coll_id = get_collection_id(collection)
-        if coll_id:
-            mythical_count = get_mythical_count_by_collection(user_id, coll_id)
-            if mythical_count >= 5:
-                leg = get_legendary_card_for_collection(coll_id)
-                if leg:
-                    keyboard_buttons.append([InlineKeyboardButton(
-                        f"⚒️ Скрафтить легендарную из {collection} (5 мифических)",
-                        callback_data=f"craft_{coll_id}"
-                    )])
-
-    if not keyboard_buttons:
-        text += "❌ Нет доступных крафтов (нужно 5 мифических одной коллекции и наличие легендарной карты в ней)."
-
-    if 'inventory_msg_id' in context.user_data:
-        try:
-            await context.bot.delete_message(chat_id=update.effective_chat.id,
-                                             message_id=context.user_data['inventory_msg_id'])
-        except Exception:
-            pass
-
-    reply_markup = InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
-    sent = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-    context.user_data['inventory_msg_id'] = sent.message_id
-
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-async def inventory_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data.startswith("craft_"):
-        collection_id = int(data.split("_")[1])
-        user_id = query.from_user.id
-
-        mythical_count = get_mythical_count_by_collection(user_id, collection_id)
-        if mythical_count < 5:
-            await query.edit_message_text("❌ У вас недостаточно мифических карт в этой коллекции.")
-            return
-
-        leg = get_legendary_card_for_collection(collection_id)
-        if not leg:
-            await query.edit_message_text("❌ В этой коллекции нет легендарной карты. Обратитесь к администратору.")
-            return
-
-        success, msg = craft_legendary(user_id, collection_id)
-        if success:
-            if 'inventory_msg_id' in context.user_data:
-                try:
-                    await context.bot.delete_message(chat_id=query.message.chat.id,
-                                                     message_id=context.user_data['inventory_msg_id'])
-                except Exception:
-                    pass
-            await inventory_command(update, context)
-            await query.message.reply_text(f"✅ {msg}")
-        else:
-            await query.edit_message_text(f"❌ {msg}")
-
-# ---------- Inline-колбэки ----------
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -716,9 +541,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=duel_shot_keyboard()
         )
         return WAITING_DUEL_SHOT
-    elif data == "free_card":
-        await free_card_command(update, context)
-        return
     return ConversationHandler.END
 
 async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -851,13 +673,11 @@ async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔️ Сессия истекла. Авторизуйтесь через /adminkarpl.")
-        await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
         return
 
     update_admin_activity(user_id)
-
     text = update.message.text
+
     if text == "➕ Добавить каналы":
         context.user_data["in_conversation"] = True
         await update.message.reply_text("Введите @username канала (бот должен быть админом):")
@@ -881,18 +701,127 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_game_settings(update, context)
         return ConversationHandler.END
     elif text == "🃏 Карточки":
-        context.user_data.clear()
-        await show_cards_admin_menu(update, context)
-        return ConversationHandler.END
+        await update.message.reply_text("🃏 Раздел управления карточками:", reply_markup=card_admin_keyboard())
+        return CARD_ADMIN_MENU
     elif text == "🚪 Выйти":
         remove_admin(user_id)
         await update.message.reply_text("🚪 Вы вышли из админ-панели.", reply_markup=main_menu_keyboard())
         await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
         return
-    else:
-        await update.message.reply_text("Используйте кнопки меню.", reply_markup=admin_menu_keyboard())
-        return
     return ConversationHandler.END
+
+# ---------- Управление карточками через Админку ----------
+async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "📁 Создать коллекцию":
+        await update.message.reply_text("📁 Введите название новой коллекции:")
+        return ADD_COLLECTION_NAME
+    elif text == "🃏 Добавить карточку":
+        kb = [["Редкая", "Очень редкая"], ["Эпическая", "Мифическая"], ["Легендарная", "Секретная"]]
+        await update.message.reply_text("✨ Выберите редкость карточки:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return ADD_CARD_RARITY
+    elif text == "🎁 Выдать карточку игроку":
+        await update.message.reply_text("🎁 Введите ID игрока и ID карточки через пробел (например: `123456789 1`):", parse_mode="Markdown")
+        return GRANT_CARD_PLAYER
+    elif text == "🔙 Назад в админку":
+        await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END
+    return CARD_ADMIN_MENU
+
+async def save_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO collections (name) VALUES (?)", (name,))
+        conn.commit()
+        await update.message.reply_text(f"✅ Коллекция **{name}** успешно создана!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text("❌ Такая коллекция уже существует или произошла ошибка.", reply_markup=card_admin_keyboard())
+    conn.close()
+    return CARD_ADMIN_MENU
+
+async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["card_rarity"] = update.message.text.strip()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT name FROM collections")
+    cols = [r[0] for r in c.fetchall()]
+    conn.close()
+    if not cols:
+        await update.message.reply_text("❌ Сначала создайте хотя бы одну коллекцию!", reply_markup=card_admin_keyboard())
+        return CARD_ADMIN_MENU
+    await update.message.reply_text("📁 Выберите коллекцию:", reply_markup=ReplyKeyboardMarkup([cols], resize_keyboard=True))
+    return ADD_CARD_COLLECTION
+
+async def card_set_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["card_collection"] = update.message.text.strip()
+    await update.message.reply_text("🏷 Введите название карточки:", reply_markup=ReplyKeyboardRemove())
+    return ADD_CARD_NAME
+
+async def card_set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["card_name"] = update.message.text.strip()
+    await update.message.reply_text("📸 Отправьте картинку (фотографию) карточки:")
+    return ADD_CARD_PHOTO
+
+async def card_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("❌ Пожалуйста, отправьте именно фотографию!")
+        return ADD_CARD_PHOTO
+
+    photo_id = update.message.photo[-1].file_id
+    rarity = context.user_data.get("card_rarity")
+    col_name = context.user_data.get("card_collection")
+    name = context.user_data.get("card_name")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id FROM collections WHERE name = ?", (col_name,))
+    row = c.fetchone()
+    if not row:
+        await update.message.reply_text("❌ Ошибка: коллекция не найдена.", reply_markup=card_admin_keyboard())
+        conn.close()
+        return CARD_ADMIN_MENU
+
+    col_id = row[0]
+    c.execute("INSERT INTO cards (collection_id, name, rarity, image_id) VALUES (?, ?, ?, ?)", (col_id, name, rarity, photo_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"✅ Карточка **{name}** ({rarity}) успешно добавлена!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
+    return CARD_ADMIN_MENU
+
+async def grant_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        parts = update.message.text.strip().split()
+        if len(parts) != 2:
+            raise ValueError()
+        user_id, card_id = int(parts[0]), int(parts[1])
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT name FROM cards WHERE id = ?", (card_id,))
+        card = c.fetchone()
+        if not card:
+            await update.message.reply_text("❌ Карточка с таким ID не найдена.", reply_markup=card_admin_keyboard())
+            conn.close()
+            return CARD_ADMIN_MENU
+
+        c.execute('''
+            INSERT INTO user_cards (user_id, card_id, count) VALUES (?, ?, 1)
+            ON CONFLICT(user_id, card_id) DO UPDATE SET count = count + 1
+        ''', (user_id, card_id))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(f"✅ Игроку {user_id} успешно выдана карточка **{card[0]}** (ID: {card_id})!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
+        try:
+            await context.bot.send_message(user_id, f"🎁 Администратор выдал вам карточку: **{card[0]}**!", parse_mode="Markdown")
+        except Exception:
+            pass
+    except Exception:
+        await update.message.reply_text("❌ Ошибка формата! Введите `ID_игрока ID_карточки` цифрами.", parse_mode="Markdown", reply_markup=card_admin_keyboard())
+    return CARD_ADMIN_MENU
 
 # ---------- Добавление каналов и чатов ----------
 async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -961,185 +890,6 @@ async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["in_conversation"] = False
     return ConversationHandler.END
 
-# ---------- Админ-раздел карточек ----------
-async def show_cards_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🃏 **Управление карточками**\n"
-        "Выберите действие:",
-        parse_mode="Markdown",
-        reply_markup=cards_admin_menu_keyboard()
-    )
-
-async def cards_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔️ Сессия истекла. Авторизуйтесь через /adminkarpl.")
-        return
-
-    update_admin_activity(user_id)
-    text = update.message.text
-
-    if text == "➕ Создать коллекцию":
-        context.user_data["in_conversation"] = True
-        await update.message.reply_text("📝 Введите название новой коллекции:")
-        return WAITING_NEW_COLLECTION_NAME
-    elif text == "🆕 Добавить карточку":
-        context.user_data["in_conversation"] = True
-        await update.message.reply_text(
-            "Выберите редкость карточки:\n"
-            "Напишите одно из: Редкая, Очень редкая, Эпическая, Мифическая, Легендарная, Секретная"
-        )
-        return WAITING_CARD_RARITY
-    elif text == "🎁 Выдать карточку игроку":
-        context.user_data["in_conversation"] = True
-        cards = get_all_cards()
-        if not cards:
-            await update.message.reply_text("❌ Нет карточек. Сначала добавьте карточку.")
-            return
-        msg = "📋 Список карточек (ID - Название):\n"
-        for cid, coll_id, rarity, name, img in cards:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute('SELECT name FROM collections WHERE id = ?', (coll_id,))
-            coll_row = c.fetchone()
-            conn.close()
-            coll_name = coll_row[0] if coll_row else "?"
-            msg += f"{cid} - {name} ({rarity}, {coll_name})\n"
-        await update.message.reply_text(msg)
-        await update.message.reply_text("✏️ Введите ID карточки, которую хотите выдать:")
-        return WAITING_CARD_ID_TO_GIVE
-    elif text == "🔙 Назад в админ-панель":
-        context.user_data.clear()
-        await update.message.reply_text("🔙 Возврат в админ-панель.", reply_markup=admin_menu_keyboard())
-        return
-    else:
-        await update.message.reply_text("Используйте кнопки меню.", reply_markup=cards_admin_menu_keyboard())
-        return
-
-# Обработчики состояний для админ-карточек
-async def create_collection_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text("Название не может быть пустым. Попробуйте снова.")
-        return WAITING_NEW_COLLECTION_NAME
-    coll_id = create_collection(name)
-    if coll_id:
-        await update.message.reply_text(f"✅ Коллекция «{name}» создана (ID: {coll_id}).", reply_markup=cards_admin_menu_keyboard())
-    else:
-        await update.message.reply_text("❌ Коллекция с таким названием уже существует.", reply_markup=cards_admin_menu_keyboard())
-    context.user_data["in_conversation"] = False
-    return ConversationHandler.END
-
-async def card_rarity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rarity = update.message.text.strip()
-    valid_rarities = ["Редкая", "Очень редкая", "Эпическая", "Мифическая", "Легендарная", "Секретная"]
-    if rarity not in valid_rarities:
-        await update.message.reply_text("❌ Неверная редкость. Выберите из: " + ", ".join(valid_rarities))
-        return WAITING_CARD_RARITY
-    context.user_data["card_rarity"] = rarity
-    collections = get_collections()
-    if not collections:
-        await update.message.reply_text("❌ Нет коллекций. Сначала создайте коллекцию.")
-        context.user_data["in_conversation"] = False
-        return ConversationHandler.END
-    msg = "📚 Выберите коллекцию, отправив её ID:\n"
-    for cid, name in collections:
-        msg += f"{cid} - {name}\n"
-    await update.message.reply_text(msg)
-    return WAITING_CARD_COLLECTION
-
-async def card_collection_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        coll_id = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Введите числовой ID коллекции.")
-        return WAITING_CARD_COLLECTION
-    collections = get_collections()
-    if coll_id not in [c[0] for c in collections]:
-        await update.message.reply_text("❌ Коллекция с таким ID не найдена.")
-        return WAITING_CARD_COLLECTION
-    context.user_data["card_collection_id"] = coll_id
-    await update.message.reply_text("📝 Введите название карточки:")
-    return WAITING_CARD_NAME
-
-async def card_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text("Название не может быть пустым.")
-        return WAITING_CARD_NAME
-    context.user_data["card_name"] = name
-    await update.message.reply_text("🖼 Теперь отправьте изображение карточки (фото или GIF).")
-    return WAITING_CARD_IMAGE
-
-async def card_image_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    file_id = None
-    if message.photo:
-        file_id = message.photo[-1].file_id
-    elif message.animation:
-        file_id = message.animation.file_id
-    elif message.document and message.document.mime_type and 'image' in message.document.mime_type:
-        file_id = message.document.file_id
-    else:
-        await update.message.reply_text("❌ Пожалуйста, отправьте фото, GIF или изображение в документе.")
-        return WAITING_CARD_IMAGE
-
-    if file_id:
-        rarity = context.user_data.get("card_rarity")
-        coll_id = context.user_data.get("card_collection_id")
-        name = context.user_data.get("card_name")
-        card_id = add_card(coll_id, rarity, name, file_id)
-        await update.message.reply_text(f"✅ Карточка «{name}» добавлена (ID: {card_id}).", reply_markup=cards_admin_menu_keyboard())
-        context.user_data.clear()
-        context.user_data["in_conversation"] = False
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text("❌ Не удалось получить изображение. Попробуйте ещё раз.")
-        return WAITING_CARD_IMAGE
-
-async def card_give_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        card_id = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Введите числовой ID карточки.")
-        return WAITING_CARD_ID_TO_GIVE
-    card = get_card(card_id)
-    if not card:
-        await update.message.reply_text("❌ Карточка с таким ID не найдена.")
-        return WAITING_CARD_ID_TO_GIVE
-    context.user_data["give_card_id"] = card_id
-    await update.message.reply_text("👤 Введите ID пользователя (число) или @username, которому выдать карточку:")
-    return WAITING_USER_ID_TO_GIVE
-
-async def card_give_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_input = update.message.text.strip()
-    user_id = None
-    if user_input.startswith('@'):
-        try:
-            chat = await context.bot.get_chat(user_input)
-            user_id = chat.id
-        except Exception as e:
-            await update.message.reply_text(f"❌ Не удалось найти пользователя: {e}")
-            return WAITING_USER_ID_TO_GIVE
-    else:
-        try:
-            user_id = int(user_input)
-        except ValueError:
-            await update.message.reply_text("❌ Введите числовой ID или @username.")
-            return WAITING_USER_ID_TO_GIVE
-
-    card_id = context.user_data.get("give_card_id")
-    if not card_id:
-        await update.message.reply_text("❌ Ошибка: ID карточки не найден.")
-        return ConversationHandler.END
-
-    give_card_to_user(user_id, card_id, 1)
-    await update.message.reply_text(f"✅ Карточка (ID {card_id}) выдана пользователю {user_id}.", reply_markup=cards_admin_menu_keyboard())
-    context.user_data.clear()
-    context.user_data["in_conversation"] = False
-    return ConversationHandler.END
-
-# ---------- Просмотр поддержки и настроек ----------
 async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = get_unanswered_messages()
     if not messages:
@@ -1205,10 +955,10 @@ async def view_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type)
         try:
             await query.message.reply_animation(gif)
         except Exception as e:
-            await query.message.reply_text("❌ Не удалось отправить GIF. Возможно, файл устарел. Попробуйте обновить его через 'Изменить'.")
-            logger.error(f"Ошибка отправки GIF при просмотре: {e}")
+            await query.message.reply_text("❌ Не удалось отправить GIF.")
+            logger.error(f"Ошибка отправки GIF: {e}")
     else:
-        await query.message.reply_text("❌ GIF не установлен. Установите его через 'Изменить'.")
+        await query.message.reply_text("❌ GIF не установлен.")
 
 async def change_gif_start(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
     query = update.callback_query
@@ -1217,13 +967,9 @@ async def change_gif_start(update: Update, context: ContextTypes.DEFAULT_TYPE, g
     context.user_data["in_conversation"] = True
     await query.edit_message_text(
         f"📤 Отправьте **GIF-файл** для {'гола' if gif_type == 'goal' else 'сейва'}.\n"
-        "Просто перешлите GIF или загрузите файл.\n"
         "Для отмены отправьте /cancel"
     )
-    if gif_type == 'goal':
-        return WAITING_GIF_GOAL
-    else:
-        return WAITING_GIF_SAVE
+    return WAITING_GIF_GOAL if gif_type == 'goal' else WAITING_GIF_SAVE
 
 async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
     message = update.message
@@ -1233,7 +979,7 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_ty
     elif message.document and message.document.mime_type and 'gif' in message.document.mime_type:
         file_id = message.document.file_id
     else:
-        await update.message.reply_text("❌ Пожалуйста, отправьте GIF-файл (анимацию или документ).")
+        await update.message.reply_text("❌ Пожалуйста, отправьте GIF-файл.")
         return WAITING_GIF_GOAL if gif_type == 'goal' else WAITING_GIF_SAVE
 
     if file_id:
@@ -1244,7 +990,7 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_ty
         await show_game_settings(update, context)
         return ConversationHandler.END
     else:
-        await update.message.reply_text("❌ Не удалось получить file_id. Попробуйте ещё раз.")
+        await update.message.reply_text("❌ Не удалось получить file_id.")
         context.user_data["in_conversation"] = False
         return ConversationHandler.END
 
@@ -1260,7 +1006,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if not is_admin(user_id):
-        await query.edit_message_text("⛔️ Сессия истекла. Авторизуйтесь заново.")
+        await query.edit_message_text("⛔️ Сессия истекла.")
         return
 
     update_admin_activity(user_id)
@@ -1269,7 +1015,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_id = int(data.split("_")[1])
         context.user_data["reply_to"] = msg_id
         context.user_data["in_conversation"] = True
-        await query.edit_message_text("✏️ Введите текст ответа (в личку боту):")
+        await query.edit_message_text("✏️ Введите текст ответа:")
         return WAITING_REPLY_TEXT
     elif data.startswith("close_"):
         msg_id = int(data.split("_")[1])
@@ -1286,12 +1032,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if messages:
             msg = messages[0]
             msg_id, user_id, username, text, timestamp = msg
-            display_text = (
-                f"📩 Обращение #{msg_id}\n"
-                f"👤 {username or user_id}\n"
-                f"🕒 {timestamp}\n\n"
-                f"{text}"
-            )
+            display_text = f"📩 Обращение #{msg_id}\n👤 {username or user_id}\n🕒 {timestamp}\n\n{text}"
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{msg_id}")],
                 [InlineKeyboardButton("✅ Закрыть", callback_data=f"close_{msg_id}")],
@@ -1342,7 +1083,6 @@ async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["in_conversation"] = False
     return ConversationHandler.END
 
-# ---------- Пересылка из каналов ----------
 async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_post = update.channel_post
     if not channel_post:
@@ -1361,11 +1101,9 @@ async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TY
     for target_id, _ in targets:
         try:
             await channel_post.copy(chat_id=target_id)
-            logger.info(f"Переслано из {chat_id} в {target_id}")
         except Exception as e:
-            logger.error(f"Ошибка пересылки в {target_id}: {e}")
+            logger.error(f"Ошибка пересылки: {e}")
 
-# ---------- Автоудаление неизвестных сообщений ----------
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
@@ -1378,14 +1116,12 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
 
     text = update.message.text
     if text in ["🏠 Главное меню", "➕ Добавить каналы", "➕ Добавить чаты", 
-                "📩 Проверить поддержку", "⚙️ Настройки", "🎮 Настройки игры", "🚪 Выйти",
-                "🃏 Карточки", "➕ Создать коллекцию", "🆕 Добавить карточку",
-                "🎁 Выдать карточку игроку", "🔙 Назад в админ-панель"]:
+                "📩 Проверить поддержку", "⚙️ Настройки", "🎮 Настройки игры", "🃏 Карточки", "🚪 Выйти"]:
         return
 
     try:
         user_msg = update.message
-        error_msg = await update.message.reply_text("❌ Ошибка! Не выбран модуль запроса. Попробуйте снова.")
+        error_msg = await update.message.reply_text("❌ Ошибка! Не выбран модуль запроса.")
         await asyncio.sleep(3)
         await user_msg.delete()
         await error_msg.delete()
@@ -1400,6 +1136,7 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
+    # Диалоги авторизации и админки
     conv_auth = ConversationHandler(
         entry_points=[CommandHandler("adminkarpl", adminkarpl)],
         states={
@@ -1490,61 +1227,52 @@ def main():
     )
     app.add_handler(conv_gif_save)
 
-    conv_new_collection = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^➕ Создать коллекцию$") & filters.ChatType.PRIVATE, cards_admin_buttons)],
+    # --- ДИАЛОГ УПРАВЛЕНИЯ КАРТОЧКАМИ В АДМИНКЕ ---
+    conv_cards = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🃏 Карточки$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
-            WAITING_NEW_COLLECTION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_collection_name)],
+            CARD_ADMIN_MENU: [
+                MessageHandler(filters.Regex("^📁 Создать коллекцию$"), add_col_start),
+                MessageHandler(filters.Regex("^🃏 Добавить карточку$"), add_card_start),
+                MessageHandler(filters.Regex("^🎁 Выдать карточку игроку$"), grant_card_start),
+            ],
+            ADD_COLLECTION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_collection)],
+            ADD_CARD_RARITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_rarity)],
+            ADD_CARD_COLLECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_collection)],
+            ADD_CARD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_set_name)],
+            ADD_CARD_PHOTO: [MessageHandler(filters.PHOTO, card_save_all)],
+            GRANT_CARD_PLAYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, grant_card_execute)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        fallbacks=[
+            MessageHandler(filters.Regex("^🔙 Назад в админку$"), lambda u,c: u.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())),
+            CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))
+        ],
         allow_reentry=True,
     )
-    app.add_handler(conv_new_collection)
+    app.add_handler(conv_cards)
 
-    conv_add_card = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🆕 Добавить карточку$") & filters.ChatType.PRIVATE, cards_admin_buttons)],
-        states={
-            WAITING_CARD_RARITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_rarity_input)],
-            WAITING_CARD_COLLECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_collection_input)],
-            WAITING_CARD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_name_input)],
-            WAITING_CARD_IMAGE: [MessageHandler(filters.PHOTO | filters.ANIMATION | filters.Document.ALL, card_image_input)],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_add_card)
-
-    conv_give_card = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🎁 Выдать карточку игроку$") & filters.ChatType.PRIVATE, cards_admin_buttons)],
-        states={
-            WAITING_CARD_ID_TO_GIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_give_id_input)],
-            WAITING_USER_ID_TO_GIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, card_give_user_input)],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_give_card)
-
-    app.add_handler(MessageHandler(filters.Regex("^📩 Проверить поддержку$") & filters.ChatType.PRIVATE, admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$") & filters.ChatType.PRIVATE, admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^🎮 Настройки игры$") & filters.ChatType.PRIVATE, admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^🃏 Карточки$") & filters.ChatType.PRIVATE, admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^🚪 Выйти$") & filters.ChatType.PRIVATE, admin_buttons))
+    # Обработчики общих кнопок админ-меню
+    app.add_handler(MessageHandler(filters.Regex("^(📩 Проверить поддержку|⚙️ Настройки|🎮 Настройки игры|🚪 Выйти)$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$") & filters.ChatType.PRIVATE, main_menu))
-    app.add_handler(MessageHandler(filters.Regex("^🔙 Назад в админ-панель$") & filters.ChatType.PRIVATE, cards_admin_buttons))
 
-    app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website|free_card)$"))
+    # Inline колбэки
+    app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website)$"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(close_|next_support|back_to_admin|view_goal_gif|view_save_gif)$"))
-    app.add_handler(CallbackQueryHandler(inventory_callback, pattern="^craft_"))
+    app.add_handler(CallbackQueryHandler(inventory_callback, pattern="^(craft_|refresh_inventory)"))
 
+    # Пересылка из каналов
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
+
+    # Автоудаление неизвестных сообщений
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_unknown_message), group=999)
 
+    # Команды пользователей
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("rating", rating))
     app.add_handler(CommandHandler("getid", getid))
+    app.add_handler(CommandHandler("freegoyda", freegoyda))
+    app.add_handler(CommandHandler("inventory", inventory))
     app.add_handler(CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.")))
-    app.add_handler(CommandHandler("freegoyda", free_card_command))
-    app.add_handler(CommandHandler("inventory", inventory_command))
 
     logger.info("Бот запущен...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
