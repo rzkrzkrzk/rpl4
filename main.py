@@ -711,22 +711,9 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ---------- Управление карточками через Админку ----------
-async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "📁 Создать коллекцию":
-        await update.message.reply_text("📁 Введите название новой коллекции:")
-        return ADD_COLLECTION_NAME
-    elif text == "🃏 Добавить карточку":
-        kb = [["Редкая", "Очень редкая"], ["Эпическая", "Мифическая"], ["Легендарная", "Секретная"]]
-        await update.message.reply_text("✨ Выберите редкость карточки:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-        return ADD_CARD_RARITY
-    elif text == "🎁 Выдать карточку игроку":
-        await update.message.reply_text("🎁 Введите ID игрока и ID карточки через пробел (например: `123456789 1`):", parse_mode="Markdown")
-        return GRANT_CARD_PLAYER
-    elif text == "🔙 Назад в админку":
-        await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-    return CARD_ADMIN_MENU
+async def add_col_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📁 Введите название новой коллекции:")
+    return ADD_COLLECTION_NAME
 
 async def save_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
@@ -741,6 +728,11 @@ async def save_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     return CARD_ADMIN_MENU
 
+async def add_card_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [["Редкая", "Очень редкая"], ["Эпическая", "Мифическая"], ["Легендарная", "Секретная"]]
+    await update.message.reply_text("✨ Выберите редкость карточки:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return ADD_CARD_RARITY
+
 async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["card_rarity"] = update.message.text.strip()
     conn = sqlite3.connect(DB_PATH)
@@ -751,7 +743,9 @@ async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cols:
         await update.message.reply_text("❌ Сначала создайте хотя бы одну коллекцию!", reply_markup=card_admin_keyboard())
         return CARD_ADMIN_MENU
-    await update.message.reply_text("📁 Выберите коллекцию:", reply_markup=ReplyKeyboardMarkup([cols], resize_keyboard=True))
+    
+    kb_cols = [cols[i:i+2] for i in range(0, len(cols), 2)]
+    await update.message.reply_text("📁 Выберите коллекцию:", reply_markup=ReplyKeyboardMarkup(kb_cols, resize_keyboard=True))
     return ADD_CARD_COLLECTION
 
 async def card_set_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -791,6 +785,10 @@ async def card_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Карточка **{name}** ({rarity}) успешно добавлена!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
     return CARD_ADMIN_MENU
 
+async def grant_card_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎁 Введите ID игрока и ID карточки через пробел (например: `123456789 1`):", parse_mode="Markdown")
+    return GRANT_CARD_PLAYER
+
 async def grant_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         parts = update.message.text.strip().split()
@@ -821,6 +819,19 @@ async def grant_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
     except Exception:
         await update.message.reply_text("❌ Ошибка формата! Введите `ID_игрока ID_карточки` цифрами.", parse_mode="Markdown", reply_markup=card_admin_keyboard())
+    return CARD_ADMIN_MENU
+
+async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "📁 Создать коллекцию":
+        return await add_col_start(update, context)
+    elif text == "🃏 Добавить карточку":
+        return await add_card_start(update, context)
+    elif text == "🎁 Выдать карточку игроку":
+        return await grant_card_start(update, context)
+    elif text == "🔙 Назад в админку":
+        await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END
     return CARD_ADMIN_MENU
 
 # ---------- Добавление каналов и чатов ----------
@@ -1175,6 +1186,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         allow_reentry=True,
+        per_message=False
     )
     app.add_handler(conv_reply)
 
@@ -1185,6 +1197,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", support_cancel)],
         allow_reentry=True,
+        per_message=False
     )
     app.add_handler(conv_support)
 
@@ -1198,6 +1211,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Игра отменена."))],
         allow_reentry=True,
+        per_message=False
     )
     app.add_handler(conv_duel)
 
@@ -1211,6 +1225,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         allow_reentry=True,
+        per_message=False
     )
     app.add_handler(conv_gif_goal)
 
@@ -1224,6 +1239,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         allow_reentry=True,
+        per_message=False
     )
     app.add_handler(conv_gif_save)
 
