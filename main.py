@@ -39,6 +39,16 @@ if not DATABASE_URL:
 
 ADMIN_SESSION_MINUTES = 30
 
+# Цены продажи карточек в зависимости от редкости
+SELL_PRICES = {
+    "Редкая": 500,
+    "Очень редкая": 1000,
+    "Эпическая": 2500,
+    "Мифическая": 5000,
+    "Легендарная": 12000,
+    "Секретная": 25000
+}
+
 # Состояния ConversationHandler
 (
     WAITING_LOGIN,
@@ -73,7 +83,8 @@ ADMIN_SESSION_MINUTES = 30
     ADD_PACK_PHOTO,
     GRANT_CARD_DATA,
     GIVE_MONEY_DATA,
-) = range(31)
+    WAITING_VIEW_USER_INV,
+) = range(32)
 
 # ---------- БД (PostgreSQL) ----------
 def get_db():
@@ -375,6 +386,7 @@ def admin_menu_keyboard():
         ["➕ Добавить каналы", "➕ Добавить чаты"],
         ["📩 Проверить поддержку", "⚙️ Настройки"],
         ["🎮 Настройки игры", "🃏 Карточки"],
+        ["🔍 Инвентарь игрока", "👥 Список игроков"],
         ["🚪 Выйти"]
     ], resize_keyboard=True)
 
@@ -539,7 +551,6 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
         # Проверка условий крафта (5 мифических одной коллекции)
         for col_id, m_count in mythic_counts.items():
             if m_count >= 5:
-                # Находим название коллекции
                 conn = get_db()
                 c = conn.cursor()
                 c.execute("SELECT name FROM collections WHERE id = %s", (col_id,))
@@ -547,6 +558,8 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
                 conn.close()
                 col_name = col_row['name'] if col_row else "Коллекция"
                 buttons.append([InlineKeyboardButton(f"🔨 Скрафтить Легендарную ({col_name})", callback_data=f"craft_leg_{col_id}")])
+
+        buttons.append([InlineKeyboardButton("💰 Продать карточки", callback_data="sell_menu")])
 
     buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_inv")])
     markup = InlineKeyboardMarkup(buttons)
@@ -561,6 +574,38 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
     else:
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
+async def show_sell_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        SELECT uc.count, c.*
+        FROM user_cards uc
+        JOIN cards c ON uc.card_id = c.id
+        WHERE uc.user_id = %s AND uc.count > 0
+        ORDER BY c.ovr DESC
+    ''', (user.id,))
+    user_cards = c.fetchall()
+    conn.close()
+
+    if not user_cards:
+        await query.answer("У вас нет карточек для продажи!", show_alert=True)
+        return
+
+    text = "💰 **Продажа карточек из инвентаря:**\nНажмите на карточку, чтобы продать 1 шт.\n\n"
+    buttons = []
+
+    for uc in user_cards:
+        price = SELL_PRICES.get(uc['rarity'], 300)
+        btn_text = f"Продать {uc['nickname']} ({uc['ovr']} OVR) — {price} RPLCoin"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"do_sell_{uc['id']}")])
+
+    buttons.append([InlineKeyboardButton("🔙 Назад в инвентарь", callback_data="refresh_inv")])
+
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
 async def inventory_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
@@ -568,6 +613,56 @@ async def inventory_callback_handler(update: Update, context: ContextTypes.DEFAU
 
     if data == "refresh_inv":
         await show_inventory(update, context, edit=True)
+
+    elif data == "sell_menu":
+        await show_sell_menu(update, context)
+
+    elif data.startswith("do_sell_"):
+        card_id = int(data.split("_")[2])
+        conn = get_db()
+        c = conn.cursor()
+
+        # Проверяем наличие карточки у игрока
+        c.execute('''
+            SELECT uc.count, c.rarity, c.nickname 
+            FROM user_cards uc 
+            JOIN cards c ON uc.card_id = c.id 
+            WHERE uc.user_id = %s AND uc.card_id = %s AND uc.count > 0
+        ''', (user.id, card_id))
+        row = c.fetchone()
+
+        if not row:
+            conn.close()
+            await query.answer("❌ У вас больше нет этой карточки!", show_alert=True)
+            await show_sell_menu(update, context)
+            return
+
+        price = SELL_PRICES.get(row['rarity'], 300)
+
+        # Уменьшаем кол-во карточек и добавляем баланс
+        c.execute("UPDATE user_cards SET count = count - 1 WHERE user_id = %s AND card_id = %s", (user.id, card_id))
+        c.execute("DELETE FROM user_cards WHERE user_id = %s AND card_id = %s AND count <= 0", (user.id, card_id))
+        c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (price, user.id))
+
+        # Если карточка закончилась, снимаем её из состава
+        c.execute("SELECT count FROM user_cards WHERE user_id = %s AND card_id = %s", (user.id, card_id))
+        rem = c.fetchone()
+        if not rem or rem['count'] <= 0:
+            c.execute('''
+                UPDATE user_rosters SET
+                    goalie_id = CASE WHEN goalie_id = %s THEN NULL ELSE goalie_id END,
+                    skater1_id = CASE WHEN skater1_id = %s THEN NULL ELSE skater1_id END,
+                    skater2_id = CASE WHEN skater2_id = %s THEN NULL ELSE skater2_id END,
+                    skater3_id = CASE WHEN skater3_id = %s THEN NULL ELSE skater3_id END,
+                    skater4_id = CASE WHEN skater4_id = %s THEN NULL ELSE skater4_id END
+                WHERE user_id = %s
+            ''', (card_id, card_id, card_id, card_id, card_id, user.id))
+
+        conn.commit()
+        conn.close()
+
+        await query.answer(f"✅ Карточка {row['nickname']} продана за {price} RPLCoin!", show_alert=True)
+        await show_sell_menu(update, context)
 
     elif data.startswith("craft_leg_"):
         col_id = int(data.split("_")[2])
@@ -1606,6 +1701,88 @@ async def give_money_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Неверный формат! Введите: `@username сумма`", reply_markup=card_admin_keyboard())
     return CARD_ADMIN_MENU
 
+# ---------- АДМИН: ПРОСМОТР ИГРОКОВ И ИНВЕНТАРЯ ----------
+async def admin_view_inventory_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip().replace("@", "")
+    conn = get_db()
+    c = conn.cursor()
+
+    if user_input.isdigit():
+        c.execute("SELECT * FROM users WHERE user_id = %s", (int(user_input),))
+    else:
+        c.execute("SELECT * FROM users WHERE username = %s", (user_input,))
+
+    target_user = c.fetchone()
+
+    if not target_user:
+        conn.close()
+        await update.message.reply_text("❌ Игрок с таким username/ID не найден!", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END
+
+    target_id = target_user['user_id']
+    c.execute('''
+        SELECT uc.count, c.*, col.name as col_name, t.name as team_name, t.emoji as team_emoji
+        FROM user_cards uc
+        JOIN cards c ON uc.card_id = c.id
+        JOIN collections col ON c.collection_id = col.id
+        LEFT JOIN card_teams t ON c.team_id = t.id
+        WHERE uc.user_id = %s AND uc.count > 0
+        ORDER BY col.name, c.ovr DESC
+    ''', (target_id,))
+    user_cards = c.fetchall()
+    conn.close()
+
+    uname = f"@{target_user['username']}" if target_user['username'] else target_user['first_name']
+    text = (
+        f"🎒 **Инвентарь игрока {uname}** (`ID: {target_id}`):\n"
+        f"💳 Баланс: **{target_user['balance']} RPLCoin** | 🏆 MMR: **{target_user['mmr']}**\n\n"
+    )
+
+    if not user_cards:
+        text += "📭 У игрока нет карточек в инвентаре."
+    else:
+        for uc in user_cards:
+            t_str = f"{uc['team_emoji']} {uc['team_name']}" if uc['team_name'] else ""
+            text += f"ID `{uc['id']}` | **{uc['nickname']}** ({uc['position']}, {uc['ovr']} OVR) — `x{uc['count']}` [{uc['rarity']}] {t_str}\n"
+
+    # Дробление сообщения если длинное
+    if len(text) > 4000:
+        parts = [text[i:i+3800] for i in range(0, len(text), 3800)]
+        for p in parts:
+            await update.message.reply_text(p, parse_mode="Markdown")
+        await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+
+    return ConversationHandler.END
+
+async def admin_show_players_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, first_name, balance, mmr FROM users ORDER BY user_id DESC")
+    users = c.fetchall()
+    conn.close()
+
+    if not users:
+        await update.message.reply_text("📭 В боте пока нет зарегистрированных игроков.", reply_markup=admin_menu_keyboard())
+        return
+
+    text = f"👥 **Список игроков, которые играли в бота (Всего: {len(users)}):**\n\n"
+    lines = []
+    for u in users:
+        uname = f"@{u['username']}" if u['username'] else u['first_name'] or "Без имени"
+        lines.append(f"• {uname} (`{u['user_id']}`) | 💳 `{u['balance']} RPLCoin` | 🏆 `{u['mmr']} MMR`")
+
+    msg_chunk = text
+    for line in lines:
+        if len(msg_chunk) + len(line) + 1 > 3800:
+            await update.message.reply_text(msg_chunk, parse_mode="Markdown")
+            msg_chunk = ""
+        msg_chunk += line + "\n"
+
+    if msg_chunk:
+        await update.message.reply_text(msg_chunk, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+
 # ---------- ОСТАЛЬНЫЕ ФУНКЦИИ БОТА ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1673,6 +1850,12 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🃏 Карточки":
         await update.message.reply_text("🃏 **Раздел управления карточками:**", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
         return CARD_ADMIN_MENU
+    elif text == "🔍 Инвентарь игрока":
+        await update.message.reply_text("🔍 Введите @username или ID игрока:")
+        return WAITING_VIEW_USER_INV
+    elif text == "👥 Список игроков":
+        await admin_show_players_list(update, context)
+        return ConversationHandler.END
     elif text == "🚪 Выйти":
         remove_admin(user_id)
         await update.message.reply_text("🚪 Вы вышли из админ-панели.", reply_markup=main_menu_keyboard())
@@ -1789,6 +1972,13 @@ def main():
     )
     app.add_handler(conv_chat)
 
+    conv_user_inv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🔍 Инвентарь игрока$") & filters.ChatType.PRIVATE, admin_buttons)],
+        states={WAITING_VIEW_USER_INV: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_view_inventory_execute)]},
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+    )
+    app.add_handler(conv_user_inv)
+
     conv_support = ConversationHandler(
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^support$")],
         states={WAITING_SUPPORT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive)]},
@@ -1836,7 +2026,7 @@ def main():
     app.add_handler(conv_cards)
 
     # Админ обработчик кнопок
-    app.add_handler(MessageHandler(filters.Regex("^(📩 Проверить поддержку|⚙️ Настройки|🎮 Настройки игры|🚪 Выйти)$") & filters.ChatType.PRIVATE, admin_buttons))
+    app.add_handler(MessageHandler(filters.Regex("^(📩 Проверить поддержку|⚙️ Настройки|🎮 Настройки игры|👥 Список игроков|🚪 Выйти)$") & filters.ChatType.PRIVATE, admin_buttons))
 
     # Команды бота
     app.add_handler(CommandHandler("start", start))
@@ -1856,7 +2046,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🏆 Топ MMR$"), cardmmr_command))
 
     # Inline callbacks
-    app.add_handler(CallbackQueryHandler(inventory_callback_handler, pattern="^(refresh_inv|craft_leg_)"))
+    app.add_handler(CallbackQueryHandler(inventory_callback_handler, pattern="^(refresh_inv|craft_leg_|sell_menu|do_sell_)"))
     app.add_handler(CallbackQueryHandler(profile_callback_handler, pattern="^(refresh_profile|edit_roster_menu|set_pos_|apply_card_)"))
     app.add_handler(CallbackQueryHandler(match_callback_handler, pattern="^(accept_match_|cancel_match_)"))
     app.add_handler(CallbackQueryHandler(shop_callback_handler, pattern="^buy_pack_"))
