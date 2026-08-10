@@ -281,6 +281,32 @@ async def check_pm_registered(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     return False
 
+def choose_card_for_user(cursor, user_id, candidate_cards):
+    """
+    Выбирает карточку для пользователя из пула candidate_cards.
+    Если у пользователя есть не все карточки из пула, выдается та, которой ЕЩЕ НЕТ.
+    Если у пользователя уже ЕСТЬ ВСЕ карточки из пула, выдается случайная повторка.
+    """
+    if not candidate_cards:
+        return None
+
+    card_ids = tuple(c['id'] for c in candidate_cards)
+    
+    if len(card_ids) == 1:
+        cursor.execute("SELECT card_id FROM user_cards WHERE user_id = %s AND card_id = %s AND count > 0", (user_id, card_ids[0]))
+    else:
+        cursor.execute("SELECT card_id FROM user_cards WHERE user_id = %s AND card_id IN %s AND count > 0", (user_id, card_ids))
+        
+    owned_rows = cursor.fetchall()
+    owned_ids = set(r['card_id'] for r in owned_rows)
+
+    unowned_cards = [c for c in candidate_cards if c['id'] not in owned_ids]
+
+    if unowned_cards:
+        return random.choice(unowned_cards)
+    else:
+        return random.choice(candidate_cards)
+
 def get_config(key):
     conn = get_db()
     c = conn.cursor()
@@ -514,7 +540,8 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 В базе пока нет карточек! Администратор скоро их добавит.")
         return
 
-    card = random.choice(cards)
+    # Защита от дубликатов
+    card = choose_card_for_user(c, user.id, cards)
     card_id = card['id']
 
     # Выдача карточки
@@ -1137,15 +1164,14 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
     score1, score2 = 0, 0
     all_events = []
 
+    # ОСНОВНОЕ ВРЕМЯ (3 периода)
     for period in range(1, 4):
         period_header = f"⏱ **ПЕРИОД {period}**\n"
         
-        # Симулируем 3 моментa за период
         for tick in range(1, 4):
             minute = (period - 1) * 20 + tick * 6 + random.randint(-1, 2)
             minute = min(60, max(1, minute))
 
-            # Шанс на гол или момент
             prob_p1 = (p1_ovr / (p1_ovr + p2_ovr)) * 0.45
             prob_p2 = (p2_ovr / (p1_ovr + p2_ovr)) * 0.45
 
@@ -1172,7 +1198,6 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                 all_events.append(evt)
 
             else:
-                # Второстепенные события (сейвы, штанги, силовые приемы, малые штрафы)
                 event_type = random.choice(["save1", "save2", "post", "hit", "penalty"])
                 if event_type == "save1":
                     evt = f"🧤 **{minute}' СЕЙВ!** Вратарь {p1_cards['goalie']['nickname']} уверенно забирает шайбу!"
@@ -1191,7 +1216,6 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
 
                 all_events.append(evt)
 
-            # Выводим последние 6 событий матча
             recent_events = "\n".join(all_events[-6:])
             status_text = (
                 f"{header}\n"
@@ -1204,22 +1228,154 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
 
     await asyncio.sleep(2)
 
+    # ОВЕРТАЙМ (при ничьей после основного времени)
+    ot_winner = None
+    if score1 == score2:
+        evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3 до золотого гола)!**"
+        all_events.append(evt_ot_start)
+        await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n\n{evt_ot_start}")
+        await asyncio.sleep(4)
+
+        for ot_min in range(61, 66):
+            prob_p1 = (p1_ovr / (p1_ovr + p2_ovr)) * 0.40
+            prob_p2 = (p2_ovr / (p1_ovr + p2_ovr)) * 0.40
+            rand_val = random.random()
+
+            if rand_val < prob_p1:
+                scorer = random.choice([p1_cards['skater1'], p1_cards['skater2']])
+                score1 += 1
+                evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔴 {name1}! [{score1}:{score2}]"
+                all_events.append(evt)
+                ot_winner = 1
+                recent_events = "\n".join(all_events[-6:])
+                await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n⏱ **ОВЕРТАЙМ**\n\n{recent_events}")
+                break
+
+            elif rand_val < prob_p1 + prob_p2:
+                scorer = random.choice([p2_cards['skater1'], p2_cards['skater2']])
+                score2 += 1
+                evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔵 {name2}! [{score1}:{score2}]"
+                all_events.append(evt)
+                ot_winner = 2
+                recent_events = "\n".join(all_events[-6:])
+                await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n⏱ **ОВЕРТАЙМ**\n\n{recent_events}")
+                break
+
+            else:
+                event_type = random.choice(["save1", "save2", "danger"])
+                if event_type == "save1":
+                    evt = f"🧤 **{ot_min}' СЕЙВ В ОВЕРТАЙМЕ!** {p1_cards['goalie']['nickname']} спасает свою команду!"
+                elif event_type == "save2":
+                    evt = f"🧤 **{ot_min}' СЕЙВ В ОВЕРТАЙМЕ!** {p2_cards['goalie']['nickname']} выручает после выхода 1 в 0!"
+                else:
+                    evt = f"⚡️ **{ot_min}' ОПАСНЕЙШИЙ МОМЕНТ!** Шайба пролетает в миллиметрах от штанги!"
+                
+                all_events.append(evt)
+
+            recent_events = "\n".join(all_events[-6:])
+            status_text = (
+                f"{header}\n"
+                f"📊 **Счет:** 🔴 {score1} — {score2} 🔵\n"
+                f"⏱ **ОВЕРТАЙМ (3х3)**\n"
+                f"📝 **Ход матча:**\n{recent_events}"
+            )
+            await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, status_text)
+            await asyncio.sleep(3.5)
+
+    await asyncio.sleep(2)
+
+    # СЕРИЯ БУЛЛИТОВ (если и овертайм закончился вничью)
+    if score1 == score2:
+        evt_so_start = "🏒 **ОВЕРТАЙМ НЕ ВЫЯВИЛ ПОБЕДИТЕЛЯ! Начинается СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ!**"
+        all_events.append(evt_so_start)
+        await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n\n{evt_so_start}")
+        await asyncio.sleep(4)
+
+        so_score1 = 0
+        so_score2 = 0
+
+        # ОСНОВНАЯ СЕРИЯ ИЗ 3 БРОСКОВ
+        for round_num in range(1, 4):
+            # Бросок игрока 1
+            sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
+            p1_success = random.random() < (sk1['ovr'] / (sk1['ovr'] + p2_cards['goalie']['ovr'])) * 0.55
+            if p1_success:
+                so_score1 += 1
+                evt1 = f"🎯 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} на паузе обыгрывает вратаря — **ГОЛ!** [{so_score1}:{so_score2}]"
+            else:
+                evt1 = f"🚫 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} бросает — {p2_cards['goalie']['nickname']} совершает **СЕЙВ!** [{so_score1}:{so_score2}]"
+            
+            all_events.append(evt1)
+            recent_events = "\n".join(all_events[-6:])
+            await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ (Раунд {round_num}/3)**\n📊 Буллиты: 🔴 {so_score1} — {so_score2} 🔵\n\n{recent_events}")
+            await asyncio.sleep(3)
+
+            # Бросок игрока 2
+            sk2 = random.choice([p2_cards['skater1'], p2_cards['skater2'], p2_cards['skater3'], p2_cards['skater4']])
+            p2_success = random.random() < (sk2['ovr'] / (sk2['ovr'] + p1_cards['goalie']['ovr'])) * 0.55
+            if p2_success:
+                so_score2 += 1
+                evt2 = f"🎯 **Буллит #{round_num} 🔵 {name2}**: {sk2['nickname']} точным броском в девятку забивает — **ГОЛ!** [{so_score1}:{so_score2}]"
+            else:
+                evt2 = f"🚫 **Буллит #{round_num} 🔵 {name2}**: {sk2['nickname']} бросает — {p1_cards['goalie']['nickname']} надежно забирает шайбу — **СЕЙВ!** [{so_score1}:{so_score2}]"
+
+            all_events.append(evt2)
+            recent_events = "\n".join(all_events[-6:])
+            await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ (Раунд {round_num}/3)**\n📊 Буллиты: 🔴 {so_score1} — {so_score2} 🔵\n\n{recent_events}")
+            await asyncio.sleep(3)
+
+        # ДОПОЛНИТЕЛЬНЫЕ РАУНДЫ БУЛЛИТОВ (до первого промаха / Внезапная смерть)
+        extra_round = 4
+        while so_score1 == so_score2 and extra_round <= 10:
+            evt_ex = f"⚡️ **Серия буллитов продолжается! Внезапная смерть (Раунд {extra_round})**"
+            all_events.append(evt_ex)
+
+            sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
+            p1_success = random.random() < (sk1['ovr'] / (sk1['ovr'] + p2_cards['goalie']['ovr'])) * 0.55
+            if p1_success:
+                so_score1 += 1
+                evt1 = f"🎯 **Буллит #{extra_round} 🔴 {name1}**: {sk1['nickname']} — **ГОЛ!** [{so_score1}:{so_score2}]"
+            else:
+                evt1 = f"🚫 **Буллит #{extra_round} 🔴 {name1}**: {sk1['nickname']} — **СЕЙВ!** [{so_score1}:{so_score2}]"
+            
+            all_events.append(evt1)
+
+            sk2 = random.choice([p2_cards['skater1'], p2_cards['skater2'], p2_cards['skater3'], p2_cards['skater4']])
+            p2_success = random.random() < (sk2['ovr'] / (sk2['ovr'] + p1_cards['goalie']['ovr'])) * 0.55
+            if p2_success:
+                so_score2 += 1
+                evt2 = f"🎯 **Буллит #{extra_round} 🔵 {name2}**: {sk2['nickname']} — **ГОЛ!** [{so_score1}:{so_score2}]"
+            else:
+                evt2 = f"🚫 **Буллит #{extra_round} 🔵 {name2}**: {sk2['nickname']} — **СЕЙВ!** [{so_score1}:{so_score2}]"
+
+            all_events.append(evt2)
+            recent_events = "\n".join(all_events[-6:])
+            await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ (Внезапная смерть)**\n📊 Буллиты: 🔴 {so_score1} — {so_score2} 🔵\n\n{recent_events}")
+            await asyncio.sleep(3)
+            extra_round += 1
+
+        # Победитель по буллитам получает +1 гол в итоговый счет
+        if so_score1 > so_score2:
+            score1 += 1
+            all_events.append(f"🏆 **Победа по буллитам достается 🔴 {name1}!** (Серия буллитов: {so_score1}:{so_score2})")
+        else:
+            score2 += 1
+            all_events.append(f"🏆 **Победа по буллитам достается 🔵 {name2}!** (Серия буллитов: {so_score1}:{so_score2})")
+
+    await asyncio.sleep(2)
+
     # Завершение и награды
     conn = get_db()
     c = conn.cursor()
 
     if score1 > score2:
-        res_text = f"🎉 **ПОБЕДА 🔴 {name1}!**\nИтоговый счет: **{score1} - {score2}**"
+        res_text = f"🎉 **ПОБЕДА 🔴 {name1}!**\nИтоговый счет (с Уч. ОВ/Б): **{score1} - {score2}**"
         apply_match_rewards(c, p1_id, is_win=True)
         apply_match_rewards(c, p2_id, is_win=False)
-    elif score2 > score1:
-        res_text = f"🎉 **ПОБЕДА 🔵 {name2}!**\nИтоговый счет: **{score1} - {score2}**"
+    else:
+        res_text = f"🎉 **ПОБЕДА 🔵 {name2}!**\nИтоговый счет (с Уч. ОВ/Б): **{score1} - {score2}**"
         apply_match_rewards(c, p2_id, is_win=True)
         apply_match_rewards(c, p1_id, is_win=False)
-    else:
-        res_text = f"🤝 **НИЧЬЯ!**\nИтоговый счет: **{score1} - {score2}**"
-        apply_match_rewards(c, p1_id, is_win=None)
-        apply_match_rewards(c, p2_id, is_win=None)
 
     conn.commit()
     conn.close()
@@ -1350,18 +1506,83 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
 
     await asyncio.sleep(2)
 
+    # ОВЕРТАЙМ С ИИ
+    if score1 == score2:
+        evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3)!**"
+        all_events.append(evt_ot_start)
+        await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🤖\n\n{evt_ot_start}")
+        await asyncio.sleep(4)
+
+        for ot_min in range(61, 66):
+            prob_p1 = (p1_ovr / (p1_ovr + ai_ovr)) * 0.40
+            prob_ai = (ai_ovr / (p1_ovr + ai_ovr)) * 0.40
+            rand_val = random.random()
+
+            if rand_val < prob_p1:
+                scorer = random.choice([p1_cards['skater1'], p1_cards['skater2']])
+                score1 += 1
+                evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔴 {name1}! [{score1}:{score2}]"
+                all_events.append(evt)
+                break
+            elif rand_val < prob_p1 + prob_ai:
+                scorer = random.choice([ai_cards['skater1'], ai_cards['skater2']])
+                score2 += 1
+                evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🤖 ИИ Боту! [{score1}:{score2}]"
+                all_events.append(evt)
+                break
+            else:
+                evt = f"🧤 **{ot_min}' ОПАСНЫЙ МОМЕНТ В ОВЕРТАЙМЕ!** Вратарь надежен!"
+                all_events.append(evt)
+
+            recent_events = "\n".join(all_events[-6:])
+            await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🤖\n⏱ **ОВЕРТАЙМ**\n\n{recent_events}")
+            await asyncio.sleep(3.5)
+
+    # БУЛЛИТЫ С ИИ (если в OT не забили)
+    if score1 == score2:
+        evt_so_start = "🏒 **СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ ПРОТИВ ИИ БОТА!**"
+        all_events.append(evt_so_start)
+        await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n\n{evt_so_start}")
+        await asyncio.sleep(4)
+
+        so_score1, so_score2 = 0, 0
+        for round_num in range(1, 4):
+            sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
+            if random.random() < (sk1['ovr'] / (sk1['ovr'] + ai_cards['goalie']['ovr'])) * 0.55:
+                so_score1 += 1
+                evt1 = f"🎯 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **ГОЛ!** [{so_score1}:{so_score2}]"
+            else:
+                evt1 = f"🚫 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **СЕЙВ!** [{so_score1}:{so_score2}]"
+            all_events.append(evt1)
+
+            sk2 = random.choice([ai_cards['skater1'], ai_cards['skater2'], ai_cards['skater3'], ai_cards['skater4']])
+            if random.random() < (sk2['ovr'] / (sk2['ovr'] + p1_cards['goalie']['ovr'])) * 0.55:
+                so_score2 += 1
+                evt2 = f"🎯 **Буллит #{round_num} 🤖 ИИ Бот**: {sk2['nickname']} — **ГОЛ!** [{so_score1}:{so_score2}]"
+            else:
+                evt2 = f"🚫 **Буллит #{round_num} 🤖 ИИ Бот**: {sk2['nickname']} — **СЕЙВ!** [{so_score1}:{so_score2}]"
+            all_events.append(evt2)
+
+            recent_events = "\n".join(all_events[-6:])
+            await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ**\n📊 Буллиты: 🔴 {so_score1} — {so_score2} 🤖\n\n{recent_events}")
+            await asyncio.sleep(3)
+
+        if so_score1 > so_score2:
+            score1 += 1
+        else:
+            score2 += 1
+
+    await asyncio.sleep(2)
+
     conn = get_db()
     c = conn.cursor()
 
     if score1 > score2:
         res_text = f"🎉 **ПОБЕДА НАД ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
         apply_match_rewards(c, p1_id, is_win=True)
-    elif score2 > score1:
+    else:
         res_text = f"❌ **ПОРАЖЕНИЕ ОТ ИИ БОТА!**\nИтоговый счет: **{score1} - {score2}**"
         apply_match_rewards(c, p1_id, is_win=False)
-    else:
-        res_text = f"🤝 **НИЧЬЯ С ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
-        apply_match_rewards(c, p1_id, is_win=None)
 
     conn.commit()
     conn.close()
@@ -1505,7 +1726,7 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         # Получаем карточки пака
-        c.execute("SELECT card_id FROM pack_cards WHERE pack_id = %s", (pack_id,))
+        c.execute("SELECT c.* FROM pack_cards pc JOIN cards c ON pc.card_id = c.id WHERE pc.pack_id = %s", (pack_id,))
         p_cards = c.fetchall()
 
         if not p_cards:
@@ -1513,7 +1734,9 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ В этом паке нет карточек!", show_alert=True)
             return
 
-        chosen_card_id = random.choice(p_cards)['card_id']
+        # Защита от дубликатов
+        chosen_card = choose_card_for_user(c, user.id, p_cards)
+        chosen_card_id = chosen_card['id']
 
         # Начисление и списание
         c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (pack['price'], user.id))
