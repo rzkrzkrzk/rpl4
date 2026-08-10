@@ -919,7 +919,7 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await show_profile(update, context)
 
 # ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) ----------
-active_searches = {}  # user_id: {chat_id, msg_id, time}
+active_searches = {}  # user_id: {chat_id, msg_id, username, first_name, start_time, task}
 
 async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -944,6 +944,39 @@ async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔎 Вы уже находитесь в поиске матча!")
         return
 
+    # МАТЧМЕЙКИНГ: Проверяем, ожидает ли уже какой-то другой игрок в очереди
+    if active_searches:
+        other_user_id = next((uid for uid in active_searches.keys() if uid != user.id), None)
+        if other_user_id:
+            search_info = active_searches.pop(other_user_id)
+            search_info["task"].cancel()
+
+            p1_id = other_user_id
+            p2_id = user.id
+            p1_chat_id = search_info["chat_id"]
+            p2_chat_id = chat_id
+            p1_msg_id = search_info["msg_id"]
+
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=p1_chat_id,
+                    message_id=p1_msg_id,
+                    text=f"⚡️ **Соперник найден!** Игрок **{user.first_name}** присоединился. Начинаем матч...",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+            msg_p2 = await update.message.reply_text(
+                f"⚡️ **Соперник найден!** Начинается матч против **{search_info.get('first_name', 'Игрока')}**...",
+                parse_mode="Markdown"
+            )
+            p2_msg_id = msg_p2.message_id
+
+            asyncio.create_task(start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg_id, context))
+            return
+
+    # Если никого в очереди нет, встаем в очередь
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚔️ Принять Поиск", callback_data=f"accept_match_{user.id}")],
         [InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_match_{user.id}")]
@@ -952,7 +985,7 @@ async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         f"🏒 Игрок **{user.first_name}** (@{user.username or user.id}) ищет соперника для матча!\n"
         f"🏆 MMR: **{u_data['mmr']}**\n\n"
-        f"Нажмите кнопку ниже, чтобы принять вызов!",
+        f"Нажмите кнопку ниже или начните поиск `/cardmatch` в любом чате!",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -960,6 +993,8 @@ async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_searches[user.id] = {
         "chat_id": chat_id,
         "msg_id": msg.message_id,
+        "username": user.username or "",
+        "first_name": user.first_name or "Игрок",
         "start_time": time.time(),
         "task": asyncio.create_task(search_timeout_worker(user.id, context))
     }
@@ -975,14 +1010,14 @@ async def search_timeout_worker(user_id, context):
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
-                text="🤖 Соперник-игрок не найден! Начинается матч против ИИ Бота...",
+                text="🤖 Соперник-игрок не найден за 60 сек.! Начинается матч против ИИ Бота...",
                 parse_mode="Markdown"
             )
         except Exception:
             pass
 
         # Старт матча с ИИ
-        await start_game_vs_ai(user_id, chat_id, context)
+        await start_game_vs_ai(user_id, chat_id, msg_id, context)
 
 async def match_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -1030,11 +1065,38 @@ async def match_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         get_or_create_user(user.id, user.username, user.first_name)
         await query.edit_message_text(f"⚔️ Игрок **{user.first_name}** принял вызов! Начинаем матч...", parse_mode="Markdown")
 
-        # Симуляция матча между игроками
-        await start_game_pvp(host_id, user.id, query.message.chat_id, context)
+        asyncio.create_task(start_game_pvp(host_id, user.id, s_info["chat_id"], query.message.chat_id, s_info["msg_id"], query.message.message_id, context))
 
-# --- Симуляция Хоккея ---
-async def start_game_pvp(p1_id, p2_id, chat_id, context):
+# --- Вспомогательный метод рассылки обновлений матча в чаты игроков ---
+async def broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, text):
+    if p1_chat_id and p1_msg_id:
+        try:
+            await context.bot.edit_message_text(chat_id=p1_chat_id, message_id=p1_msg_id, text=text, parse_mode="Markdown")
+        except Exception:
+            pass
+            
+    if p2_chat_id and p2_msg_id and (p2_chat_id != p1_chat_id or p2_msg_id != p1_msg_id):
+        try:
+            await context.bot.edit_message_text(chat_id=p2_chat_id, message_id=p2_msg_id, text=text, parse_mode="Markdown")
+        except Exception:
+            pass
+
+def format_cards_list(cards_dict):
+    pos_labels = {
+        "goalie": "🧤 Вратарь",
+        "skater1": "🏒 Полевой 1",
+        "skater2": "🏒 Полевой 2",
+        "skater3": "🏒 Полевой 3",
+        "skater4": "🏒 Полевой 4",
+    }
+    lines = []
+    for k, v in cards_dict.items():
+        label = pos_labels.get(k, "🏒")
+        lines.append(f"  • {label}: **{v['nickname']}** ({v['ovr']} OVR)")
+    return "\n".join(lines)
+
+# --- Симуляция Хоккея (PvP) ---
+async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg_id, context):
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE user_id = %s", (p1_id,))
@@ -1055,78 +1117,125 @@ async def start_game_pvp(p1_id, p2_id, chat_id, context):
     p1_ovr = sum(c['ovr'] for c in p1_cards.values()) / 5.0
     p2_ovr = sum(c['ovr'] for c in p2_cards.values()) / 5.0
 
-    match_msg = await context.bot.send_message(
-        chat_id,
+    name1 = u1['first_name'] or u1['username'] or str(p1_id)
+    name2 = u2['first_name'] or u2['username'] or str(p2_id)
+
+    roster1_text = format_cards_list(p1_cards)
+    roster2_text = format_cards_list(p2_cards)
+
+    header = (
         f"🏒 **МАТЧ НАЧАЛСЯ!**\n"
-        f"🔴 @{u1['username'] or u1['user_id']} ({p1_ovr:.1f} OVR) vs 🔵 @{u2['username'] or u2['user_id']} ({p2_ovr:.1f} OVR)\n\n"
-        f"⏱ 1-й Период стартовал!",
-        parse_mode="Markdown"
+        f"🔴 **{name1}** ({p1_ovr:.1f} OVR) vs 🔵 **{name2}** ({p2_ovr:.1f} OVR)\n\n"
+        f"📋 **Состав {name1}:**\n{roster1_text}\n\n"
+        f"📋 **Состав {name2}:**\n{roster2_text}\n\n"
+        f"────────────────────\n"
     )
 
+    await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}⏱ **1-й Период стартует! Команды выходят на лед...**")
+    await asyncio.sleep(4)
+
     score1, score2 = 0, 0
-    events = []
+    all_events = []
 
     for period in range(1, 4):
-        await asyncio.sleep(4)
-        period_text = f"⏱ **Период {period} в разгаре...**\n"
+        period_header = f"⏱ **ПЕРИОД {period}**\n"
         
-        # Генерация шансов на гол
-        for _ in range(2):
-            if random.random() < (p1_ovr / (p1_ovr + p2_ovr)) * 0.45:
+        # Симулируем 3 моментa за период
+        for tick in range(1, 4):
+            minute = (period - 1) * 20 + tick * 6 + random.randint(-1, 2)
+            minute = min(60, max(1, minute))
+
+            # Шанс на гол или момент
+            prob_p1 = (p1_ovr / (p1_ovr + p2_ovr)) * 0.45
+            prob_p2 = (p2_ovr / (p1_ovr + p2_ovr)) * 0.45
+
+            rand_val = random.random()
+
+            if rand_val < prob_p1:
                 scorer = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
+                assist_cand = [p for k, p in p1_cards.items() if k != 'goalie' and p['id'] != scorer['id']]
+                assist = random.choice(assist_cand) if assist_cand else None
                 score1 += 1
-                evt = f"⚡️ **ГОЛ!** Забил **{scorer['nickname']}** от @{u1['username'] or u1['user_id']}!"
-                events.append(evt)
-                period_text += f"\n{evt}"
-            
-            if random.random() < (p2_ovr / (p1_ovr + p2_ovr)) * 0.45:
+                
+                assist_str = f" (пас: {assist['nickname']})" if assist else ""
+                evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']}{assist_str} забивает за🔴 {name1}! [{score1}:{score2}]"
+                all_events.append(evt)
+
+            elif rand_val < prob_p1 + prob_p2:
                 scorer = random.choice([p2_cards['skater1'], p2_cards['skater2'], p2_cards['skater3'], p2_cards['skater4']])
+                assist_cand = [p for k, p in p2_cards.items() if k != 'goalie' and p['id'] != scorer['id']]
+                assist = random.choice(assist_cand) if assist_cand else None
                 score2 += 1
-                evt = f"⚡️ **ГОЛ!** Забил **{scorer['nickname']}** от @{u2['username'] or u2['user_id']}!"
-                events.append(evt)
-                period_text += f"\n{evt}"
 
-        try:
-            await match_msg.edit_text(
-                f"🏒 **МАТЧ В ПРОЦЕССЕ** (Счет: {score1} - {score2})\n"
-                f"🔴 @{u1['username'] or u1['user_id']} vs 🔵 @{u2['username'] or u2['user_id']}\n\n"
-                f"{period_text}",
-                parse_mode="Markdown"
+                assist_str = f" (пас: {assist['nickname']})" if assist else ""
+                evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']}{assist_str} забивает за🔵 {name2}! [{score1}:{score2}]"
+                all_events.append(evt)
+
+            else:
+                # Второстепенные события (сейвы, штанги, силовые приемы, малые штрафы)
+                event_type = random.choice(["save1", "save2", "post", "hit", "penalty"])
+                if event_type == "save1":
+                    evt = f"🧤 **{minute}' СЕЙВ!** Вратарь {p1_cards['goalie']['nickname']} уверенно забирает шайбу!"
+                elif event_type == "save2":
+                    evt = f"🧤 **{minute}' СЕЙВ!** Вратарь {p2_cards['goalie']['nickname']} отражает сильнейший бросок!"
+                elif event_type == "post":
+                    sk = random.choice([p1_cards['skater1'], p2_cards['skater1']])
+                    evt = f"🏒 **{minute}' ШТАНГА!** {sk['nickname']} наносит мощный щелчок, но шайба попадает в каркас!"
+                elif event_type == "hit":
+                    sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2']])
+                    sk2 = random.choice([p2_cards['skater1'], p2_cards['skater2']])
+                    evt = f"💥 **{minute}' СИЛОВОЙ ПРИЕМ!** {sk1['nickname']} жестко встретил {sk2['nickname']} у борта!"
+                else:
+                    sk = random.choice([p1_cards['skater3'], p2_cards['skater3']])
+                    evt = f"2️⃣ **{minute}' УДАЛЕНИЕ!** {sk['nickname']} получает 2 минуты малого штрафа."
+
+                all_events.append(evt)
+
+            # Выводим последние 6 событий матча
+            recent_events = "\n".join(all_events[-6:])
+            status_text = (
+                f"{header}\n"
+                f"📊 **Текущий Счет:** 🔴 {score1} — {score2} 🔵\n"
+                f"{period_header}\n"
+                f"📝 **Ход матча:**\n{recent_events}"
             )
-        except Exception:
-            pass
+            await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, status_text)
+            await asyncio.sleep(3.5)
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
 
     # Завершение и награды
     conn = get_db()
     c = conn.cursor()
 
     if score1 > score2:
-        res_text = f"🎉 **ПОБЕДА 🔴 @{u1['username'] or u1['user_id']}!**\nИтоговый счет: {score1} - {score2}"
+        res_text = f"🎉 **ПОБЕДА 🔴 {name1}!**\nИтоговый счет: **{score1} - {score2}**"
         apply_match_rewards(c, p1_id, is_win=True)
         apply_match_rewards(c, p2_id, is_win=False)
     elif score2 > score1:
-        res_text = f"🎉 **ПОБЕДА 🔵 @{u2['username'] or u2['user_id']}!**\nИтоговый счет: {score1} - {score2}"
+        res_text = f"🎉 **ПОБЕДА 🔵 {name2}!**\nИтоговый счет: **{score1} - {score2}**"
         apply_match_rewards(c, p2_id, is_win=True)
         apply_match_rewards(c, p1_id, is_win=False)
     else:
-        res_text = f"🤝 **НИЧЬЯ!**\nИтоговый счет: {score1} - {score2}"
+        res_text = f"🤝 **НИЧЬЯ!**\nИтоговый счет: **{score1} - {score2}**"
         apply_match_rewards(c, p1_id, is_win=None)
         apply_match_rewards(c, p2_id, is_win=None)
 
     conn.commit()
     conn.close()
 
-    await match_msg.edit_text(
+    final_text = (
         f"🏁 **МАТЧ ЗАВЕРШЕН!**\n\n"
         f"{res_text}\n\n"
         f"🏆 Победитель получил: **+50 MMR** и **+2000 RPLCoin**\n"
-        f"🥈 Проигравший получил: **-15 MMR** и **+500 RPLCoin**",
-        parse_mode="Markdown"
+        f"🥈 Проигравший получил: **-15 MMR** и **+500 RPLCoin**\n\n"
+        f"📋 **Полный протокол игры:**\n" + "\n".join(all_events)
     )
 
-async def start_game_vs_ai(p1_id, chat_id, context):
+    await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, final_text)
+
+# --- Симуляция Хоккея (Против ИИ Бота) ---
+async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE user_id = %s", (p1_id,))
@@ -1154,13 +1263,12 @@ async def start_game_vs_ai(p1_id, chat_id, context):
     ai_goalies = [cd for cd in ai_candidates if cd['position'] == 'Goalie']
 
     if not ai_skaters or not ai_goalies:
-        # Резервные карточки ботов
         ai_cards = {
-            "goalie": {"nickname": "AI_Goalie #1", "ovr": int(p1_ovr)},
-            "skater1": {"nickname": "AI_Skater #2", "ovr": int(p1_ovr)},
-            "skater2": {"nickname": "AI_Skater #3", "ovr": int(p1_ovr)},
-            "skater3": {"nickname": "AI_Skater #4", "ovr": int(p1_ovr)},
-            "skater4": {"nickname": "AI_Skater #5", "ovr": int(p1_ovr)}
+            "goalie": {"id": -1, "nickname": "AI Вратарь", "ovr": int(p1_ovr)},
+            "skater1": {"id": -2, "nickname": "AI Форвард #1", "ovr": int(p1_ovr)},
+            "skater2": {"id": -3, "nickname": "AI Форвард #2", "ovr": int(p1_ovr)},
+            "skater3": {"id": -4, "nickname": "AI Защитник #1", "ovr": int(p1_ovr)},
+            "skater4": {"id": -5, "nickname": "AI Защитник #2", "ovr": int(p1_ovr)}
         }
     else:
         ai_cards = {
@@ -1173,58 +1281,98 @@ async def start_game_vs_ai(p1_id, chat_id, context):
 
     ai_ovr = sum(cd['ovr'] for cd in ai_cards.values()) / 5.0
 
-    match_msg = await context.bot.send_message(
-        chat_id,
+    name1 = u1['first_name'] or u1['username'] or str(p1_id)
+    name2 = "🤖 ИИ Бот"
+
+    roster1_text = format_cards_list(p1_cards)
+    roster2_text = format_cards_list(ai_cards)
+
+    header = (
         f"🏒 **МАТЧ ПРОТИВ ИИ БОТА НАЧАЛСЯ!**\n"
-        f"🔴 @{u1['username'] or u1['user_id']} ({p1_ovr:.1f} OVR) vs 🤖 ИИ Бот ({ai_ovr:.1f} OVR)\n\n"
-        f"⏱ 1-й Период стартовал!",
-        parse_mode="Markdown"
+        f"🔴 **{name1}** ({p1_ovr:.1f} OVR) vs 🤖 **ИИ Бот** ({ai_ovr:.1f} OVR)\n\n"
+        f"📋 **Состав {name1}:**\n{roster1_text}\n\n"
+        f"📋 **Состав ИИ Бота:**\n{roster2_text}\n\n"
+        f"────────────────────\n"
     )
 
+    await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}⏱ **1-й Период стартует! Команды выходят на лед...**")
+    await asyncio.sleep(4)
+
     score1, score2 = 0, 0
+    all_events = []
 
     for period in range(1, 4):
-        await asyncio.sleep(4)
-        period_text = f"⏱ **Период {period} в разгаре...**\n"
+        period_header = f"⏱ **ПЕРИОД {period}**\n"
 
-        for _ in range(2):
-            if random.random() < (p1_ovr / (p1_ovr + ai_ovr)) * 0.45:
+        for tick in range(1, 4):
+            minute = (period - 1) * 20 + tick * 6 + random.randint(-1, 2)
+            minute = min(60, max(1, minute))
+
+            prob_p1 = (p1_ovr / (p1_ovr + ai_ovr)) * 0.45
+            prob_ai = (ai_ovr / (p1_ovr + ai_ovr)) * 0.45
+
+            rand_val = random.random()
+
+            if rand_val < prob_p1:
                 scorer = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
                 score1 += 1
-                period_text += f"\n⚡️ **ГОЛ!** Забил **{scorer['nickname']}**!"
-            
-            if random.random() < (ai_ovr / (p1_ovr + ai_ovr)) * 0.45:
+                evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']} забивает за🔴 {name1}! [{score1}:{score2}]"
+                all_events.append(evt)
+
+            elif rand_val < prob_p1 + prob_ai:
                 scorer = random.choice([ai_cards['skater1'], ai_cards['skater2'], ai_cards['skater3'], ai_cards['skater4']])
                 score2 += 1
-                period_text += f"\n⚡️ **ГОЛ!** Забил **{scorer['nickname']}** (ИИ Бот)!"
+                evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']} (ИИ Бот) забивает за🤖 ИИ Бота! [{score1}:{score2}]"
+                all_events.append(evt)
 
-        try:
-            await match_msg.edit_text(
-                f"🏒 **МАТЧ ПРОТИВ ИИ БОТА** (Счет: {score1} - {score2})\n\n{period_text}",
-                parse_mode="Markdown"
+            else:
+                event_type = random.choice(["save1", "save2", "post", "hit"])
+                if event_type == "save1":
+                    evt = f"🧤 **{minute}' СЕЙВ!** {p1_cards['goalie']['nickname']} забирает шайбу!"
+                elif event_type == "save2":
+                    evt = f"🧤 **{minute}' СЕЙВ!** ИИ Вратарь отражает опасный бросок!"
+                elif event_type == "post":
+                    evt = f"🏒 **{minute}' ШТАНГА!** Мощный щелчок сотрясает ворота!"
+                else:
+                    evt = f"💥 **{minute}' СИЛОВОЙ ПРИЕМ!** Игроки сошлись у борта!"
+
+                all_events.append(evt)
+
+            recent_events = "\n".join(all_events[-6:])
+            status_text = (
+                f"{header}\n"
+                f"📊 **Текущий Счет:** 🔴 {score1} — {score2} 🤖\n"
+                f"{period_header}\n"
+                f"📝 **Ход матча:**\n{recent_events}"
             )
-        except Exception:
-            pass
+            await broadcast_match_text(context, chat_id, msg_id, None, None, status_text)
+            await asyncio.sleep(3.5)
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
 
     conn = get_db()
     c = conn.cursor()
 
     if score1 > score2:
-        res_text = f"🎉 **ПОБЕДА НАД ИИ БОТОМ!**\nИтоговый счет: {score1} - {score2}"
+        res_text = f"🎉 **ПОБЕДА НАД ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
         apply_match_rewards(c, p1_id, is_win=True)
     elif score2 > score1:
-        res_text = f"❌ **ПОРАЖЕНИЕ ОТ ИИ БОТА!**\nИтоговый счет: {score1} - {score2}"
+        res_text = f"❌ **ПОРАЖЕНИЕ ОТ ИИ БОТА!**\nИтоговый счет: **{score1} - {score2}**"
         apply_match_rewards(c, p1_id, is_win=False)
     else:
-        res_text = f"🤝 **НИЧЬЯ С ИИ БОТОМ!**\nИтоговый счет: {score1} - {score2}"
+        res_text = f"🤝 **НИЧЬЯ С ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
         apply_match_rewards(c, p1_id, is_win=None)
 
     conn.commit()
     conn.close()
 
-    await match_msg.edit_text(f"🏁 **МАТЧ ЗАВЕРШЕН!**\n\n{res_text}", parse_mode="Markdown")
+    final_text = (
+        f"🏁 **МАТЧ ЗАВЕРШЕН!**\n\n"
+        f"{res_text}\n\n"
+        f"📋 **Протокол игры:**\n" + "\n".join(all_events)
+    )
+
+    await broadcast_match_text(context, chat_id, msg_id, None, None, final_text)
 
 def get_roster_cards(cursor, roster):
     cursor.execute("SELECT * FROM cards WHERE id IN (%s, %s, %s, %s, %s)", 
