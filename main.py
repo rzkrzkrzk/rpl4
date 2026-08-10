@@ -252,6 +252,35 @@ def get_or_create_user(user_id, username="", first_name=""):
     conn.close()
     return row
 
+def check_user_exists(user_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row)
+
+async def check_pm_registered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+        
+    if check_user_exists(user.id):
+        return True
+
+    bot_username = context.bot.username
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Написать боту в ЛС", url=f"https://t.me/{bot_username}?start=start")]
+    ])
+    msg_text = "⚠️ **Чтобы взаимодействовать с ботом, сначала напишите ему в личные сообщения!**"
+    
+    if update.callback_query:
+        await update.callback_query.answer("⚠️ Сначала напишите боту в ЛС!", show_alert=True)
+    elif update.message:
+        await update.message.reply_text(msg_text, reply_markup=kb, parse_mode="Markdown")
+        
+    return False
+
 def get_config(key):
     conn = get_db()
     c = conn.cursor()
@@ -424,8 +453,19 @@ COUNTRIES = [
     "UK", "France", "Austria", "Norway", "Denmark", "Japan", "China"
 ]
 
+# ---------- КОМАНДА /getid ----------
+async def getid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"🆔 **ID этого чата:** `{chat.id}`\n📌 **Тип чата:** `{chat.type}`",
+        parse_mode="Markdown"
+    )
+
 # ---------- ЛОГИКА КАРТОЧЕК И ВЫДАЧИ (/rplcards) ----------
 async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     user = update.effective_user
     u_data = get_or_create_user(user.id, user.username, user.first_name)
     now = datetime.now()
@@ -510,6 +550,9 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ИНВЕНТАРЬ И КРАФТ (/inventory) ----------
 async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     user = update.effective_user
     get_or_create_user(user.id, user.username, user.first_name)
     await show_inventory(update, context)
@@ -607,6 +650,9 @@ async def show_sell_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
 async def inventory_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     query = update.callback_query
     user = query.from_user
     data = query.data
@@ -718,6 +764,9 @@ async def inventory_callback_handler(update: Update, context: ContextTypes.DEFAU
 
 # ---------- ПРОФИЛЬ И СОСТАВ (/profile) ----------
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     user = update.effective_user
     u_data = get_or_create_user(user.id, user.username, user.first_name)
     await show_profile(update, context)
@@ -788,6 +837,9 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
 
 async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     query = update.callback_query
     user = query.from_user
     data = query.data
@@ -870,6 +922,9 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
 active_searches = {}  # user_id: {chat_id, msg_id, time}
 
 async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     user = update.effective_user
     chat_id = update.effective_chat.id
     u_data = get_or_create_user(user.id, user.username, user.first_name)
@@ -930,6 +985,9 @@ async def search_timeout_worker(user_id, context):
         await start_game_vs_ai(user_id, chat_id, context)
 
 async def match_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     query = update.callback_query
     user = query.from_user
     data = query.data
@@ -1190,6 +1248,9 @@ def apply_match_rewards(cursor, user_id, is_win):
 
 # ---------- ТОР MMR (/cardmmr) ----------
 async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT username, first_name, mmr FROM users ORDER BY mmr DESC LIMIT 10")
@@ -1205,6 +1266,9 @@ async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- МАГАЗИН И ПАКИ (/shop) ----------
 async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     user = update.effective_user
     get_or_create_user(user.id, user.username, user.first_name)
     await show_shop(update, context)
@@ -1255,6 +1319,9 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     query = update.callback_query
     user = query.from_user
     data = query.data
@@ -1795,6 +1862,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
     await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
 
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1912,6 +1981,9 @@ async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("🎮 Настройки дуэли буллитов настроены.", reply_markup=admin_menu_keyboard())
 
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1946,6 +2018,9 @@ async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- MAIN ----------
 def main():
     app = Application.builder().token(TOKEN).build()
+
+    # Команда /getid
+    app.add_handler(CommandHandler("getid", getid_command))
 
     # Админ авторизация
     conv_auth = ConversationHandler(
