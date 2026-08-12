@@ -39,7 +39,7 @@ if not DATABASE_URL:
 
 ADMIN_SESSION_MINUTES = 30
 
-# Цены продажи карточек в зависимости от редкости
+# Цены быстрой продажи карточек системно
 SELL_PRICES = {
     "Редкая": 500,
     "Очень редкая": 1000,
@@ -84,12 +84,17 @@ SELL_PRICES = {
     GRANT_CARD_DATA,
     GIVE_MONEY_DATA,
     WAITING_VIEW_USER_INV,
-    # Промокоды (Админка)
+    # Промокоды
     ADD_PROMO_CODE,
     ADD_PROMO_TYPE,
-    ADD_PROMO_REWARD,
+    ADD_PROMO_VAL,
     ADD_PROMO_LIMIT,
-) = range(36)
+    WAITING_PROMO_INPUT,
+    # Рынок и Трейд
+    WAITING_TRADE_TARGET,
+    WAITING_TRADE_MONEY,
+    WAITING_MARKET_PRICE_INPUT,
+) = range(40)
 
 # ---------- БД (PostgreSQL) ----------
 def get_db():
@@ -232,43 +237,33 @@ def init_db():
         )
     ''')
 
-    # Трейды
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            sender_id BIGINT NOT NULL,
-            receiver_id BIGINT NOT NULL,
-            card_id INTEGER REFERENCES cards(id) ON DELETE CASCADE,
-            money INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'pending'
-        )
-    ''')
-
-    # Торговая площадка (/cardshop)
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS card_shop_listings (
-            id SERIAL PRIMARY KEY,
-            seller_id BIGINT NOT NULL,
-            card_id INTEGER REFERENCES cards(id) ON DELETE CASCADE,
-            price INTEGER NOT NULL
-        )
-    ''')
-
     # Промокоды
     c.execute('''
-        CREATE TABLE IF NOT EXISTS promos (
+        CREATE TABLE IF NOT EXISTS promo_codes (
             code TEXT PRIMARY KEY,
-            reward_type TEXT NOT NULL, -- 'money' или 'card'
-            reward_value INTEGER NOT NULL, -- сумма денег или ID карточки
-            max_uses INTEGER NOT NULL, -- сколько всего раз можно активировать
-            used_count INTEGER DEFAULT 0
+            reward_type TEXT NOT NULL,
+            reward_value INTEGER NOT NULL,
+            max_uses INTEGER DEFAULT 1,
+            current_uses INTEGER DEFAULT 0
         )
     ''')
     c.execute('''
-        CREATE TABLE IF NOT EXISTS promo_activations (
-            user_id BIGINT,
-            code TEXT REFERENCES promos(code) ON DELETE CASCADE,
+        CREATE TABLE IF NOT EXISTS user_promocodes (
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            code TEXT REFERENCES promo_codes(code) ON DELETE CASCADE,
+            used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(user_id, code)
+        )
+    ''')
+
+    # Торговая площадка (Рынок)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS market (
+            id SERIAL PRIMARY KEY,
+            seller_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            card_id INTEGER REFERENCES cards(id) ON DELETE CASCADE,
+            price INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -476,11 +471,11 @@ def mark_answered(msg_id):
 # ---------- КЛАВИАТУРЫ ----------
 def main_menu_keyboard():
     return ReplyKeyboardMarkup([
-        ["🏠 Главное меню", "🎒 Инвентарь"],
+        ["🏠 Главное меню", "🃏 Бесплатная карта"],
+        ["🎒 Инвентарь", "🛒 Торговая площадка"],
         ["🏒 Состав и Профиль", "⚔️ Искать игру"],
-        ["🛒 Магазин Паков", "🎴 Бесплатная карта"],
-        ["🔄 Трейд", "🛍 Торговая площадка"],
-        ["🎟 Промокод", "🏆 Топ MMR"]
+        ["🛒 Магазин Паков", "🏆 Топ MMR"],
+        ["🤝 Трейд", "🎁 Промокод"]
     ], resize_keyboard=True)
 
 def admin_menu_keyboard():
@@ -488,8 +483,8 @@ def admin_menu_keyboard():
         ["➕ Добавить каналы", "➕ Добавить чаты"],
         ["📩 Проверить поддержку", "⚙️ Настройки"],
         ["🎮 Настройки игры", "🃏 Карточки"],
-        ["🎟 Создать промокод", "🔍 Инвентарь игрока"],
-        ["👥 Список игроков", "🚪 Выйти"]
+        ["🔍 Инвентарь игрока", "👥 Список игроков"],
+        ["🚪 Выйти"]
     ], resize_keyboard=True)
 
 def card_admin_keyboard():
@@ -498,7 +493,7 @@ def card_admin_keyboard():
         ["❌ Удалить команду", "🃏 Добавить карточку"],
         ["❌ Удалить карточку", "📦 Добавить пак"],
         ["🎁 Выдать карточку игроку", "💰 Выдать деньги"],
-        ["⬅️ Выйти из настройки карточек"]
+        ["🎟 Создать промокод", "⬅️ Выйти из настройки карточек"]
     ], resize_keyboard=True)
 
 def welcome_inline_keyboard():
@@ -534,7 +529,7 @@ async def getid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ---------- ЛОГИКА КАРТОЧЕК И ВЫДАЧИ (/rplcards) ----------
+# ---------- ЛОГИКА КАРТОЧЕК И ВЫДАЧИ (/rplcards / Кнопка) ----------
 async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -547,16 +542,22 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last_claim:
         if isinstance(last_claim, str):
             last_claim = datetime.fromisoformat(last_claim)
-        if now < last_claim + timedelta(hours=8):
+        if now < last_claim + timedelta(hours=8):  # Обновлено КД до 8 часов!
             wait = (last_claim + timedelta(hours=8)) - now
             hours, rem = divmod(wait.seconds, 3600)
             minutes = rem // 60
-            await update.message.reply_text(f"⏳ Бесплатную карточку можно получать раз в 8 часов!\nПодожди ещё: **{hours} ч {minutes} мин**", parse_mode="Markdown")
+            await update.message.reply_text(f"⏳ Бесплатную карточку можно получать раз в **8 часов**!\nПодожди ещё: **{hours} ч {minutes} мин**", parse_mode="Markdown")
             return
 
-    # Анимация ожидания получения карточки (3 секунды)
-    wait_msg = await update.message.reply_text("📦 **Идет открытие и поиск карточки...** ⏳", parse_mode="Markdown")
+    # Отправляем анимацию ожидания на 3 секунды
+    temp_msg = await update.message.reply_text("⏳ **Идет открытие карточки...**", parse_mode="Markdown")
     await asyncio.sleep(3)
+
+    # Удаляем временное сообщение
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=temp_msg.message_id)
+    except Exception:
+        pass
 
     # Допустимые редкости
     rarity = random.choices(
@@ -576,6 +577,7 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cards = c.fetchall()
 
     if not cards:
+        # Резервный выбор любой карточки (кроме Секретной)
         c.execute('''
             SELECT c.*, col.name as collection_name, t.name as team_name, t.emoji as team_emoji
             FROM cards c
@@ -587,16 +589,14 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not cards:
         conn.close()
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
         await update.message.reply_text("📭 В базе пока нет карточек! Администратор скоро их добавит.")
         return
 
+    # Защита от дубликатов
     card = choose_card_for_user(c, user.id, cards)
     card_id = card['id']
 
+    # Выдача карточки
     c.execute('''
         INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1)
         ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1
@@ -605,15 +605,10 @@ async def rplcards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    try:
-        await wait_msg.delete()
-    except Exception:
-        pass
-
     team_str = f"{card['team_emoji'] or '🏒'} {card['team_name']}" if card['team_name'] else "Без команды"
     
     caption = (
-        f"🔥 **Новая карточка!**\n\n"
+        f"🔥 **Вам выпала карточка!**\n\n"
         f"┏━━━━━━━━━━━━━━━━━━━━┓\n"
         f"┃ 👤 {card['nickname']}\n"
         f"┃ 🏒 {card['position']}\n"
@@ -663,7 +658,7 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
     buttons = []
 
     if not user_cards:
-        text += "У вас пока нет карточек! Получите первую с помощью команды /rplcards или купите пак в /shop."
+        text += "У вас пока нет карточек! Получите бесплатную или купите пак в /shop."
     else:
         mythic_counts = {}
         for uc in user_cards:
@@ -684,7 +679,8 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
                 col_name = col_row['name'] if col_row else "Коллекция"
                 buttons.append([InlineKeyboardButton(f"🔨 Скрафтить Легендарную ({col_name})", callback_data=f"craft_leg_{col_id}")])
 
-        buttons.append([InlineKeyboardButton("💰 Продать карточки", callback_data="sell_menu")])
+        buttons.append([InlineKeyboardButton("🏷 Выставить на Рынок", callback_data="market_list_menu")])
+        buttons.append([InlineKeyboardButton("💰 Продать карточки (системе)", callback_data="sell_menu")])
 
     buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_inv")])
     markup = InlineKeyboardMarkup(buttons)
@@ -719,7 +715,7 @@ async def show_sell_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("У вас нет карточек для продажи!", show_alert=True)
         return
 
-    text = "💰 **Продажа карточек из инвентаря:**\nНажмите на карточку, чтобы продать 1 шт.\n\n"
+    text = "💰 **Продажа карточек системе:**\nНажмите на карточку, чтобы продать 1 шт.\n\n"
     buttons = []
 
     for uc in user_cards:
@@ -837,13 +833,789 @@ async def inventory_callback_handler(update: Update, context: ContextTypes.DEFAU
         await query.answer("🎉 Вы успешно скрафтили Легендарную карточку!", show_alert=True)
         await show_inventory(update, context, edit=True)
 
+# ---------- ТОРГОВАЯ ПЛОЩАДКА (/cardshop) ----------
+async def cardshop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
+    user = update.effective_user
+    get_or_create_user(user.id, user.username, user.first_name)
+    await show_market(update, context)
+
+async def show_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user if query else update.effective_user
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        SELECT m.id as market_id, m.price, m.seller_id, c.id as card_id, c.nickname, c.position, c.ovr, c.rarity, u.username, u.first_name
+        FROM market m
+        JOIN cards c ON m.card_id = c.id
+        JOIN users u ON m.seller_id = u.user_id
+        ORDER BY m.id DESC
+        LIMIT 25
+    ''')
+    items = c.fetchall()
+
+    c.execute("SELECT COUNT(*) as cnt FROM market WHERE seller_id = %s", (user.id,))
+    my_cnt = c.fetchone()['cnt']
+    conn.close()
+
+    text = "🛒 **ТОРГОВАЯ ПЛОЩАДКА (РЫНОК):**\nЗдесь игроки продают и покупают карточки друг у друга!\n\n"
+    buttons = []
+
+    if not items:
+        text += "📭 На рынке сейчас нет выставленных лотов."
+    else:
+        for item in items:
+            seller_name = f"@{item['username']}" if item['username'] else item['first_name']
+            text += f"🏷 **#{item['market_id']}** | **{item['nickname']}** ({item['position']}, {item['ovr']} OVR) [{item['rarity']}] — **{item['price']} RPLCoin** (Продавец: {seller_name})\n"
+            if item['seller_id'] != user.id:
+                buttons.append([InlineKeyboardButton(f"Купить #{item['market_id']} ({item['nickname']}) - {item['price']} RPLCoin", callback_data=f"buy_market_{item['market_id']}")])
+
+    nav_btns = []
+    if my_cnt > 0:
+        nav_btns.append(InlineKeyboardButton(f"📦 Мои лоты ({my_cnt})", callback_data="my_market_items"))
+    nav_btns.append(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_market"))
+    
+    buttons.append(nav_btns)
+
+    markup = InlineKeyboardMarkup(buttons)
+    if query:
+        await query.answer()
+        try:
+            await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+        except Exception:
+            await query.message.delete()
+            await context.bot.send_message(user.id, text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+async def show_my_market_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        SELECT m.id as market_id, m.price, c.nickname, c.position, c.ovr, c.rarity
+        FROM market m
+        JOIN cards c ON m.card_id = c.id
+        WHERE m.seller_id = %s
+        ORDER BY m.id DESC
+    ''', (user.id,))
+    my_items = c.fetchall()
+    conn.close()
+
+    text = "📦 **Ваши выставленные карточки на рынке:**\n\n"
+    buttons = []
+
+    if not my_items:
+        text += "У вас нет активных объявлений на рынке."
+    else:
+        for item in my_items:
+            text += f"🏷 **#{item['market_id']}** | **{item['nickname']}** ({item['ovr']} OVR) — `{item['price']} RPLCoin`\n"
+            buttons.append([InlineKeyboardButton(f"❌ Снять #{item['market_id']} ({item['nickname']})", callback_data=f"cancel_market_{item['market_id']}")])
+
+    buttons.append([InlineKeyboardButton("🔙 Назад на рынок", callback_data="refresh_market")])
+
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+async def market_start_list_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        SELECT uc.count, c.id, c.nickname, c.ovr, c.position, c.rarity
+        FROM user_cards uc
+        JOIN cards c ON uc.card_id = c.id
+        WHERE uc.user_id = %s AND uc.count > 0
+        ORDER BY c.ovr DESC
+    ''', (user.id,))
+    user_cards = c.fetchall()
+    conn.close()
+
+    if not user_cards:
+        await query.answer("У вас нет карточек в инвентаре!", show_alert=True)
+        return
+
+    text = "🏷 **Выставить карточку на Торговую площадку:**\nВыберите карточку, которую хотите выставить на продажу:"
+    buttons = []
+    for uc in user_cards:
+        buttons.append([InlineKeyboardButton(f"{uc['nickname']} ({uc['ovr']} OVR) - x{uc['count']}", callback_data=f"select_mcard_{uc['id']}")])
+
+    buttons.append([InlineKeyboardButton("🔙 Назад в инвентарь", callback_data="refresh_inv")])
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+async def market_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+
+    if data == "refresh_market":
+        await show_market(update, context)
+
+    elif data == "my_market_items":
+        await show_my_market_items(update, context)
+
+    elif data == "market_list_menu":
+        await market_start_list_card(update, context)
+
+    elif data.startswith("select_mcard_"):
+        card_id = int(data.split("_")[2])
+        context.user_data["m_card_id"] = card_id
+        await query.message.reply_text("💲 **Введите цену продажи (в RPLCoin, максимум 999 999):**\nНапример: `1500`", parse_mode="Markdown")
+        return WAITING_MARKET_PRICE_INPUT
+
+    elif data.startswith("cancel_market_"):
+        market_id = int(data.split("_")[2])
+        conn = get_db()
+        c = conn.cursor()
+
+        c.execute("SELECT * FROM market WHERE id = %s AND seller_id = %s", (market_id, user.id))
+        item = c.fetchone()
+
+        if not item:
+            conn.close()
+            await query.answer("❌ Лот не найден или уже продан!", show_alert=True)
+            await show_my_market_items(update, context)
+            return
+
+        # Возвращаем карту игроку
+        c.execute('''
+            INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1)
+            ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1
+        ''', (user.id, item['card_id']))
+        c.execute("DELETE FROM market WHERE id = %s", (market_id,))
+
+        conn.commit()
+        conn.close()
+
+        await query.answer("✅ Карточка снята с продажи и возвращена в инвентарь!", show_alert=True)
+        await show_my_market_items(update, context)
+
+    elif data.startswith("buy_market_"):
+        market_id = int(data.split("_")[2])
+        conn = get_db()
+        c = conn.cursor()
+
+        c.execute("SELECT * FROM market WHERE id = %s", (market_id,))
+        item = c.fetchone()
+
+        if not item:
+            conn.close()
+            await query.answer("❌ Этот лот уже продан или снят!", show_alert=True)
+            await show_market(update, context)
+            return
+
+        if item['seller_id'] == user.id:
+            conn.close()
+            await query.answer("❌ Вы не можете купить собственный лот!", show_alert=True)
+            return
+
+        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
+        buyer_bal = c.fetchone()['balance']
+
+        if buyer_bal < item['price']:
+            conn.close()
+            await query.answer("❌ Недостаточно RPLCoin для покупки!", show_alert=True)
+            return
+
+        # Проведение покупки
+        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (item['price'], user.id))
+        c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (item['price'], item['seller_id']))
+
+        c.execute('''
+            INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1)
+            ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1
+        ''', (user.id, item['card_id']))
+
+        c.execute("DELETE FROM market WHERE id = %s", (market_id,))
+
+        conn.commit()
+        conn.close()
+
+        # Уведомляем продавца
+        try:
+            await context.bot.send_message(chat_id=item['seller_id'], text=f"🎉 Ваш лот на рынке куплен! Зачислено **{item['price']} RPLCoin**.", parse_mode="Markdown")
+        except Exception:
+            pass
+
+        await query.answer("🎉 Вы успешно купили карточку с рынка!", show_alert=True)
+        await show_market(update, context)
+
+async def execute_market_list_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = int(update.message.text.strip())
+        if price <= 0 or price > 999999:
+            await update.message.reply_text("❌ Цена должна быть от 1 до 999 999 RPLCoin! Попробуйте снова:")
+            return WAITING_MARKET_PRICE_INPUT
+
+        card_id = context.user_data.get("m_card_id")
+        user = update.effective_user
+
+        conn = get_db()
+        c = conn.cursor()
+
+        c.execute("SELECT count FROM user_cards WHERE user_id = %s AND card_id = %s AND count > 0", (user.id, card_id))
+        row = c.fetchone()
+
+        if not row:
+            conn.close()
+            await update.message.reply_text("❌ У вас больше нет этой карточки!")
+            return ConversationHandler.END
+
+        # Снимаем 1 карту и ставим на рынок
+        c.execute("UPDATE user_cards SET count = count - 1 WHERE user_id = %s AND card_id = %s", (user.id, card_id))
+        c.execute("DELETE FROM user_cards WHERE user_id = %s AND card_id = %s AND count <= 0", (user.id, card_id))
+
+        # Удаляем из состава если закончились
+        c.execute("SELECT count FROM user_cards WHERE user_id = %s AND card_id = %s", (user.id, card_id))
+        rem = c.fetchone()
+        if not rem or rem['count'] <= 0:
+            c.execute('''
+                UPDATE user_rosters SET
+                    goalie_id = CASE WHEN goalie_id = %s THEN NULL ELSE goalie_id END,
+                    skater1_id = CASE WHEN skater1_id = %s THEN NULL ELSE skater1_id END,
+                    skater2_id = CASE WHEN skater2_id = %s THEN NULL ELSE skater2_id END,
+                    skater3_id = CASE WHEN skater3_id = %s THEN NULL ELSE skater3_id END,
+                    skater4_id = CASE WHEN skater4_id = %s THEN NULL ELSE skater4_id END
+                WHERE user_id = %s
+            ''', (card_id, card_id, card_id, card_id, card_id, user.id))
+
+        c.execute("INSERT INTO market (seller_id, card_id, price) VALUES (%s, %s, %s)", (user.id, card_id, price))
+
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(f"✅ **Карточка успешно выставляется за {price} RPLCoin на Торговую площадку!**", parse_mode="Markdown")
+        await show_market(update, context)
+        return ConversationHandler.END
+
+    except ValueError:
+        await update.message.reply_text("❌ Введите цену целым числом (до 999 999):")
+        return WAITING_MARKET_PRICE_INPUT
+
+# ---------- СИСТЕМА ТРЕЙДА (/trade) ----------
+active_trades = {}  # trade_id: {p1, p2, p1_cards: [], p2_cards: [], p1_money: 0, p2_money: 0, p1_ready: False, p2_ready: False, msgs: {p1: msg_id, p2: msg_id}}
+
+async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
+    user = update.effective_user
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("🤝 **Введи команду с указанием никнейма или ID:**\nПример: `/trade @username` или `/trade 123456789`", parse_mode="Markdown")
+        return
+
+    target_str = args[0].replace("@", "")
+    conn = get_db()
+    c = conn.cursor()
+
+    if target_str.isdigit():
+        c.execute("SELECT * FROM users WHERE user_id = %s", (int(target_str),))
+    else:
+        c.execute("SELECT * FROM users WHERE username = %s", (target_str,))
+
+    target_user = c.fetchone()
+    conn.close()
+
+    if not target_user:
+        await update.message.reply_text("❌ Игрок не найден в базе данных бота!")
+        return
+
+    if target_user['user_id'] == user.id:
+        await update.message.reply_text("❌ Вы не можете отправить предложение трейда самому себе!")
+        return
+
+    target_id = target_user['user_id']
+
+    # Проверка, не в трейде ли уже
+    for tid, tdata in active_trades.items():
+        if user.id in (tdata['p1'], tdata['p2']) or target_id in (tdata['p1'], tdata['p2']):
+            await update.message.reply_text("❌ Один из игроков уже находится в активном трейде!")
+            return
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Принять Трейд", callback_data=f"accept_trade_{user.id}_{target_id}")],
+        [InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_trade_{user.id}_{target_id}")]
+    ])
+
+    await update.message.reply_text(f"🤝 Вы отправили предложение обмена игроку **{target_user['first_name']}**! Ожидание ответа...", parse_mode="Markdown")
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🤝 **Игрок {user.first_name} (@{user.username or user.id}) предлагает вам обмен (трейд)!**\nХотите принять предложение?",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await update.message.reply_text("❌ Не удалось отправить уведомление игроку (возможно, бот заблокирован им).")
+
+async def render_trade_text(tdata, for_user_id):
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute("SELECT first_name, username FROM users WHERE user_id = %s", (tdata['p1'],))
+    u1 = c.fetchone()
+    c.execute("SELECT first_name, username FROM users WHERE user_id = %s", (tdata['p2'],))
+    u2 = c.fetchone()
+
+    name1 = u1['first_name'] if u1 else str(tdata['p1'])
+    name2 = u2['first_name'] if u2 else str(tdata['p2'])
+
+    # Сбор карточек P1
+    p1_cards_str = ""
+    if tdata['p1_cards']:
+        c.execute("SELECT id, nickname, ovr, position FROM cards WHERE id IN %s", (tuple(tdata['p1_cards']),))
+        cds = c.fetchall()
+        for cd in cds:
+            p1_cards_str += f"  • {cd['nickname']} ({cd['ovr']} OVR)\n"
+    else:
+        p1_cards_str = "  *(карточки не выбраны)*\n"
+
+    # Сбор карточек P2
+    p2_cards_str = ""
+    if tdata['p2_cards']:
+        c.execute("SELECT id, nickname, ovr, position FROM cards WHERE id IN %s", (tuple(tdata['p2_cards']),))
+        cds = c.fetchall()
+        for cd in cds:
+            p2_cards_str += f"  • {cd['nickname']} ({cd['ovr']} OVR)\n"
+    else:
+        p2_cards_str = "  *(карточки не выбраны)*\n"
+
+    conn.close()
+
+    r1_status = "✅ ГОТОВ" if tdata['p1_ready'] else "⏳ Выбирает..."
+    r2_status = "✅ ГОТОВ" if tdata['p2_ready'] else "⏳ Выбирает..."
+
+    text = (
+        f"🤝 **ОКНО ОБМЕНА (ТРЕЙД)**\n\n"
+        f"🔴 **Предложение {name1}** [{r1_status}]:\n"
+        f"💳 RPLCoin: **{tdata['p1_money']}**\n"
+        f"🃏 Карточки:\n{p1_cards_str}\n"
+        f"────────────────────\n"
+        f"🔵 **Предложение {name2}** [{r2_status}]:\n"
+        f"💳 RPLCoin: **{tdata['p2_money']}**\n"
+        f"🃏 Карточки:\n{p2_cards_str}\n"
+    )
+    return text
+
+async def update_trade_views(context, trade_id):
+    if trade_id not in active_trades:
+        return
+    tdata = active_trades[trade_id]
+
+    p1, p2 = tdata['p1'], tdata['p2']
+    m1, m2 = tdata['msgs'].get(p1), tdata['msgs'].get(p2)
+
+    txt = await render_trade_text(tdata, p1)
+
+    # Кнопки для P1
+    p1_ready_btn = InlineKeyboardButton("❌ Снять готовность" if tdata['p1_ready'] else "✅ ПОДТВЕРДИТЬ ГОТОВНОСТЬ", callback_data=f"tr_ready_{trade_id}")
+    kb1 = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить карту", callback_data=f"tr_addcard_{trade_id}"), InlineKeyboardButton("💵 Изменить RPLCoin", callback_data=f"tr_addmoney_{trade_id}")],
+        [InlineKeyboardButton("🗑 Очистить предложение", callback_data=f"tr_clear_{trade_id}")],
+        [p1_ready_btn],
+        [InlineKeyboardButton("🚫 Отменить Трейд", callback_data=f"tr_cancel_{trade_id}")]
+    ])
+
+    # Кнопки для P2
+    p2_ready_btn = InlineKeyboardButton("❌ Снять готовность" if tdata['p2_ready'] else "✅ ПОДТВЕРДИТЬ ГОТОВНОСТЬ", callback_data=f"tr_ready_{trade_id}")
+    kb2 = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить карту", callback_data=f"tr_addcard_{trade_id}"), InlineKeyboardButton("💵 Изменить RPLCoin", callback_data=f"tr_addmoney_{trade_id}")],
+        [InlineKeyboardButton("🗑 Очистить предложение", callback_data=f"tr_clear_{trade_id}")],
+        [p2_ready_btn],
+        [InlineKeyboardButton("🚫 Отменить Трейд", callback_data=f"tr_cancel_{trade_id}")]
+    ])
+
+    if m1:
+        try:
+            await context.bot.edit_message_text(chat_id=p1, message_id=m1, text=txt, reply_markup=kb1, parse_mode="Markdown")
+        except Exception:
+            pass
+    if m2:
+        try:
+            await context.bot.edit_message_text(chat_id=p2, message_id=m2, text=txt, reply_markup=kb2, parse_mode="Markdown")
+        except Exception:
+            pass
+
+async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+
+    if data.startswith("accept_trade_"):
+        parts = data.split("_")
+        p1 = int(parts[2])
+        p2 = int(parts[3])
+
+        if user.id != p2:
+            await query.answer("❌ Этот запрос отправлен не вам!", show_alert=True)
+            return
+
+        trade_id = f"{p1}_{p2}_{int(time.time())}"
+        active_trades[trade_id] = {
+            "p1": p1, "p2": p2,
+            "p1_cards": [], "p2_cards": [],
+            "p1_money": 0, "p2_money": 0,
+            "p1_ready": False, "p2_ready": False,
+            "msgs": {}
+        }
+
+        m1 = await context.bot.send_message(chat_id=p1, text="🤝 **Трейд принят! Загрузка...**", parse_mode="Markdown")
+        m2 = await query.message.edit_text("🤝 **Трейд начат! Загрузка...**", parse_mode="Markdown")
+
+        active_trades[trade_id]["msgs"][p1] = m1.message_id
+        active_trades[trade_id]["msgs"][p2] = m2.message_id
+
+        await update_trade_views(context, trade_id)
+
+    elif data.startswith("decline_trade_"):
+        parts = data.split("_")
+        p1 = int(parts[2])
+        await query.edit_message_text("❌ Предложение трейда отклонено.")
+        try:
+            await context.bot.send_message(chat_id=p1, text="❌ Игрок отклонил ваше предложение обмена.")
+        except Exception:
+            pass
+
+    elif data.startswith("tr_"):
+        parts = data.split("_")
+        action = parts[1]
+        trade_id = "_".join(parts[2:])
+
+        if trade_id not in active_trades:
+            await query.answer("❌ Этот трейд больше не активен!", show_alert=True)
+            return
+
+        tdata = active_trades[trade_id]
+        if user.id not in (tdata['p1'], tdata['p2']):
+            await query.answer("❌ Вы не участвуете в этом трейде!", show_alert=True)
+            return
+
+        is_p1 = (user.id == tdata['p1'])
+
+        if action == "cancel":
+            del active_trades[trade_id]
+            for uid, mid in tdata['msgs'].items():
+                try:
+                    await context.bot.edit_message_text(chat_id=uid, message_id=mid, text="🚫 **Трейд отменен одной из сторон.**", parse_mode="Markdown")
+                except Exception:
+                    pass
+            return
+
+        elif action == "clear":
+            if is_p1:
+                tdata['p1_cards'] = []
+                tdata['p1_money'] = 0
+            else:
+                tdata['p2_cards'] = []
+                tdata['p2_money'] = 0
+            
+            tdata['p1_ready'] = False
+            tdata['p2_ready'] = False
+            await query.answer("Предложение очищено!")
+            await update_trade_views(context, trade_id)
+
+        elif action == "addmoney":
+            context.user_data["active_trade_id"] = trade_id
+            await query.message.reply_text("💵 **Введите сумму RPLCoin для трейда:**", parse_mode="Markdown")
+            return WAITING_TRADE_MONEY
+
+        elif action == "addcard":
+            conn = get_db()
+            c = conn.cursor()
+            c.execute('''
+                SELECT uc.card_id, uc.count, c.nickname, c.ovr, c.position
+                FROM user_cards uc
+                JOIN cards c ON uc.card_id = c.id
+                WHERE uc.user_id = %s AND uc.count > 0
+                ORDER BY c.ovr DESC
+            ''', (user.id,))
+            user_cards = c.fetchall()
+            conn.close()
+
+            if not user_cards:
+                await query.answer("У вас нет доступных карточек для обмена!", show_alert=True)
+                return
+
+            buttons = []
+            curr_cards = tdata['p1_cards'] if is_p1 else tdata['p2_cards']
+            for uc in user_cards:
+                cnt_in_tr = curr_cards.count(uc['card_id'])
+                if uc['count'] - cnt_in_tr > 0:
+                    buttons.append([InlineKeyboardButton(f"{uc['nickname']} ({uc['ovr']} OVR)", callback_data=f"tr_putcard_{trade_id}_{uc['card_id']}")])
+
+            buttons.append([InlineKeyboardButton("🔙 Назад", callback_data=f"tr_back_{trade_id}")])
+            await query.edit_message_text("📋 **Выберите карточку для добавления в предложении:**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+        elif action == "putcard":
+            card_id = int(parts[3])
+            tr_id = "_".join(parts[2:-1])
+            tdata = active_trades.get(tr_id)
+            if not tdata:
+                return
+
+            if is_p1:
+                tdata['p1_cards'].append(card_id)
+            else:
+                tdata['p2_cards'].append(card_id)
+
+            tdata['p1_ready'] = False
+            tdata['p2_ready'] = False
+            await update_trade_views(context, tr_id)
+
+        elif action == "back":
+            await update_trade_views(context, trade_id)
+
+        elif action == "ready":
+            if is_p1:
+                tdata['p1_ready'] = not tdata['p1_ready']
+            else:
+                tdata['p2_ready'] = not tdata['p2_ready']
+
+            await update_trade_views(context, trade_id)
+
+            # Проверяем, если ОБА готовы — завершаем трейд!
+            if tdata['p1_ready'] and tdata['p2_ready']:
+                await execute_trade_finish(context, trade_id)
+
+async def execute_trade_finish(context, trade_id):
+    if trade_id not in active_trades:
+        return
+    tdata = active_trades.pop(trade_id)
+
+    p1, p2 = tdata['p1'], tdata['p2']
+    c1, c2 = tdata['p1_cards'], tdata['p2_cards']
+    m1, m2 = tdata['p1_money'], tdata['p2_money']
+
+    conn = get_db()
+    c = conn.cursor()
+
+    # Валидация бабки P1/P2
+    c.execute("SELECT balance FROM users WHERE user_id = %s", (p1,))
+    b1 = c.fetchone()['balance']
+    c.execute("SELECT balance FROM users WHERE user_id = %s", (p2,))
+    b2 = c.fetchone()['balance']
+
+    if b1 < m1 or b2 < m2:
+        conn.close()
+        for uid, mid in tdata['msgs'].items():
+            try:
+                await context.bot.edit_message_text(chat_id=uid, message_id=mid, text="❌ **Ошибка трейда!** У одного из игроков недостаточно средств.")
+            except Exception:
+                pass
+        return
+
+    # Перевод денег
+    c.execute("UPDATE users SET balance = balance - %s + %s WHERE user_id = %s", (m1, m2, p1))
+    c.execute("UPDATE users SET balance = balance - %s + %s WHERE user_id = %s", (m2, m1, p2))
+
+    # Передача карт от P1 к P2
+    for card_id in c1:
+        c.execute("UPDATE user_cards SET count = count - 1 WHERE user_id = %s AND card_id = %s", (p1, card_id))
+        c.execute("DELETE FROM user_cards WHERE user_id = %s AND card_id = %s AND count <= 0", (p1, card_id))
+        c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (p2, card_id))
+
+    # Передача карт от P2 к P1
+    for card_id in c2:
+        c.execute("UPDATE user_cards SET count = count - 1 WHERE user_id = %s AND card_id = %s", (p2, card_id))
+        c.execute("DELETE FROM user_cards WHERE user_id = %s AND card_id = %s AND count <= 0", (p2, card_id))
+        c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (p1, card_id))
+
+    conn.commit()
+    conn.close()
+
+    for uid, mid in tdata['msgs'].items():
+        try:
+            await context.bot.edit_message_text(chat_id=uid, message_id=mid, text="🎉 **ОБМЕН УСПЕШНО ЗАВЕРШЕН!**\nВсе предметы и балансы обновлены.", parse_mode="Markdown")
+        except Exception:
+            pass
+
+async def execute_trade_money_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text.strip())
+        if val < 0:
+            val = 0
+
+        user = update.effective_user
+        trade_id = context.user_data.get("active_trade_id")
+
+        if not trade_id or trade_id not in active_trades:
+            await update.message.reply_text("❌ Трейд не активен!")
+            return ConversationHandler.END
+
+        tdata = active_trades[trade_id]
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
+        u_bal = c.fetchone()['balance']
+        conn.close()
+
+        if val > u_bal:
+            await update.message.reply_text(f"❌ У вас нет столько RPLCoin! Ваш баланс: {u_bal}")
+            return WAITING_TRADE_MONEY
+
+        if user.id == tdata['p1']:
+            tdata['p1_money'] = val
+        else:
+            tdata['p2_money'] = val
+
+        tdata['p1_ready'] = False
+        tdata['p2_ready'] = False
+
+        await update.message.reply_text(f"✅ Установлена сумма {val} RPLCoin.")
+        await update_trade_views(context, trade_id)
+        return ConversationHandler.END
+
+    except ValueError:
+        await update.message.reply_text("❌ Введите сумму целым числом!")
+        return WAITING_TRADE_MONEY
+
+# ---------- ПРОМОКОДЫ (/promo) ----------
+async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_pm_registered(update, context):
+        return
+
+    user = update.effective_user
+    get_or_create_user(user.id, user.username, user.first_name)
+
+    if context.args:
+        code = context.args[0].strip().upper()
+        await process_promo_code(update, context, user.id, code)
+        return
+
+    await update.message.reply_text("🎟 **Введите ваш промокод:**", parse_mode="Markdown")
+    return WAITING_PROMO_INPUT
+
+async def promo_input_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip().upper()
+    user = update.effective_user
+    await process_promo_code(update, context, user.id, code)
+    return ConversationHandler.END
+
+async def process_promo_code(update, context, user_id, code):
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM promo_codes WHERE code = %s", (code,))
+    promo = c.fetchone()
+
+    if not promo:
+        conn.close()
+        await update.message.reply_text("❌ Введен несуществующий или недействительный промокод!")
+        return
+
+    c.execute("SELECT * FROM user_promocodes WHERE user_id = %s AND code = %s", (user_id, code))
+    already_used = c.fetchone()
+
+    if already_used:
+        conn.close()
+        await update.message.reply_text("❌ Вы уже активировали этот промокод!")
+        return
+
+    if promo['current_uses'] >= promo['max_uses']:
+        conn.close()
+        await update.message.reply_text("❌ У этого промокода закончились использования!")
+        return
+
+    # Выдача награды
+    reward_msg = ""
+    if promo['reward_type'] == 'money':
+        c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (promo['reward_value'], user_id))
+        reward_msg = f"💳 **+{promo['reward_value']} RPLCoin**"
+    elif promo['reward_type'] == 'card':
+        c.execute('''
+            INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1)
+            ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1
+        ''', (user_id, promo['reward_value']))
+        c.execute("SELECT nickname, ovr FROM cards WHERE id = %s", (promo['reward_value'],))
+        cd = c.fetchone()
+        cd_name = f"{cd['nickname']} ({cd['ovr']} OVR)" if cd else f"Карточка ID {promo['reward_value']}"
+        reward_msg = f"🃏 **{cd_name}**"
+
+    c.execute("UPDATE promo_codes SET current_uses = current_uses + 1 WHERE code = %s", (code,))
+    c.execute("INSERT INTO user_promocodes (user_id, code) VALUES (%s, %s)", (user_id, code))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"🎉 **Промокод успешно активирован!**\nВы получили: {reward_msg}", parse_mode="Markdown")
+
+# --- Создание промокода в админке ---
+async def admin_create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎟 **Введите текст нового промокода (например: `RPL2026`):**", parse_mode="Markdown")
+    return ADD_PROMO_CODE
+
+async def admin_promo_set_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["p_code"] = update.message.text.strip().upper()
+    kb = [["💰 Деньги", "🃏 Карточка"]]
+    await update.message.reply_text("🎁 Выберите тип награды:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return ADD_PROMO_TYPE
+
+async def admin_promo_set_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t_text = update.message.text.strip()
+    r_type = "money" if "Деньги" in t_text else "card"
+    context.user_data["p_reward_type"] = r_type
+
+    if r_type == "money":
+        await update.message.reply_text("💰 Введите количество денег (RPLCoin):", reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.message.reply_text("🃏 Введите ID выдаваемой карточки:", reply_markup=ReplyKeyboardRemove())
+
+    return ADD_PROMO_VAL
+
+async def admin_promo_set_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text.strip())
+        context.user_data["p_reward_val"] = val
+        await update.message.reply_text("🔢 Введите общее количество активаций (лимит использования):")
+        return ADD_PROMO_LIMIT
+    except ValueError:
+        await update.message.reply_text("❌ Введите число!")
+        return ADD_PROMO_VAL
+
+async def admin_promo_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        limit = int(update.message.text.strip())
+        code = context.user_data.get("p_code")
+        r_type = context.user_data.get("p_reward_type")
+        r_val = context.user_data.get("p_reward_val")
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO promo_codes (code, reward_type, reward_value, max_uses, current_uses)
+            VALUES (%s, %s, %s, %s, 0)
+            ON CONFLICT (code) DO UPDATE SET reward_type = EXCLUDED.reward_type, reward_value = EXCLUDED.reward_value, max_uses = EXCLUDED.max_uses
+        ''', (code, r_type, r_val, limit))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(f"✅ Промокод `{code}` успешно создан на **{limit}** использований!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
+        return CARD_ADMIN_MENU
+
+    except ValueError:
+        await update.message.reply_text("❌ Введите число!")
+        return ADD_PROMO_LIMIT
+
 # ---------- ПРОФИЛЬ И СОСТАВ (/profile) ----------
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
 
     user = update.effective_user
-    get_or_create_user(user.id, user.username, user.first_name)
+    u_data = get_or_create_user(user.id, user.username, user.first_name)
     await show_profile(update, context)
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -992,477 +1764,60 @@ async def profile_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.answer("✅ Карточка успешно установлена!")
         await show_profile(update, context)
 
-# ---------- СИСТЕМА ТРЕЙДОВ (/trade) ----------
-async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_pm_registered(update, context):
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "🤝 **Система Трейдов и Обменов:**\n\n"
-            "Использование:\n"
-            "• `/trade @username ID_карточки [сумма_денег]` — предложить карточку/деньги другу.\n"
-            "• `/trade check` — посмотреть входящие/исходящие предложения обмена.",
-            parse_mode="Markdown"
-        )
-        return
-
-    if args[0].lower() == "check":
-        await show_trades_list(update, context)
-        return
-
-    if len(args) < 2:
-        await update.message.reply_text("❌ Неверный формат! Пример: `/trade @friend 5 1000`", parse_mode="Markdown")
-        return
-
-    target_input = args[0].replace("@", "")
-    card_id = int(args[1])
-    money = int(args[2]) if len(args) > 2 and args[2].isdigit() else 0
-
-    sender = update.effective_user
-    if money < 0:
-        await update.message.reply_text("❌ Сумма не может быть отрицательной!")
-        return
-
-    conn = get_db()
-    c = conn.cursor()
-
-    # Ищем получателя
-    if target_input.isdigit():
-        c.execute("SELECT * FROM users WHERE user_id = %s", (int(target_input),))
-    else:
-        c.execute("SELECT * FROM users WHERE username = %s", (target_input,))
-    receiver = c.fetchone()
-
-    if not receiver:
-        conn.close()
-        await update.message.reply_text("❌ Получатель не найден в боте!")
-        return
-
-    receiver_id = receiver['user_id']
-    if receiver_id == sender.id:
-        conn.close()
-        await update.message.reply_text("❌ Нельзя отправить трейд самому себе!")
-        return
-
-    # Проверяем наличие карточки у отправителя
-    c.execute("SELECT count FROM user_cards WHERE user_id = %s AND card_id = %s AND count > 0", (sender.id, card_id))
-    uc_row = c.fetchone()
-    if not uc_row:
-        conn.close()
-        await update.message.reply_text("❌ У вас нет этой карточки в инвентаре!")
-        return
-
-    # Проверяем баланс отправителя для денег
-    c.execute("SELECT balance FROM users WHERE user_id = %s", (sender.id,))
-    s_bal = c.fetchone()['balance']
-    if s_bal < money:
-        conn.close()
-        await update.message.reply_text("❌ У вас недостаточно RPLCoin для этого обмена!")
-        return
-
-    # Создаем запись трейда
-    c.execute('''
-        INSERT INTO trades (sender_id, receiver_id, card_id, money, status)
-        VALUES (%s, %s, %s, %s, 'pending')
-        RETURNING id
-    ''', (sender.id, receiver_id, card_id, money))
-    trade_id = c.fetchone()['id']
-    conn.commit()
-
-    c.execute("SELECT nickname, ovr FROM cards WHERE id = %s", (card_id,))
-    card_info = c.fetchone()
-    conn.close()
-
-    await update.message.reply_text(f"✅ Предложение обмена успешно отправлено игроку @{receiver.get('username') or receiver_id}!")
-
-    # Уведомляем получателя в ЛС
-    try:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Принять трейд", callback_data=f"trade_accept_{trade_id}")],
-            [InlineKeyboardButton("❌ Отклонить", callback_data=f"trade_decline_{trade_id}")]
-        ])
-        await context.bot.send_message(
-            chat_id=receiver_id,
-            text=f"🤝 **Вам поступил новый трейд!**\n\n"
-                 f"👤 От: {sender.first_name}\n"
-                 f"🎴 Карточка: **{card_info['nickname']}** ({card_info['ovr']} OVR)\n"
-                 f"💰 RPLCoin в довесок: `{money}`\n\n"
-                 f"Используйте команду `/trade check` или кнопки ниже:",
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
-
-async def show_trades_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''
-        SELECT t.*, c.nickname, c.ovr 
-        FROM trades t
-        JOIN cards c ON t.card_id = c.id
-        WHERE t.receiver_id = %s AND t.status = 'pending'
-    ''', (user.id,))
-    trades = c.fetchall()
-    conn.close()
-
-    if not trades:
-        await update.message.reply_text("📭 У вас нет активных входящих предложений обмена.")
-        return
-
-    for t in trades:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Принять", callback_data=f"trade_accept_{t['id']}")],
-            [InlineKeyboardButton("❌ Отклонить", callback_data=f"trade_decline_{t['id']}")]
-        ])
-        text = (
-            f"🤝 **Предложение обмена #{t['id']}**\n"
-            f"🎴 Карточка: **{t['nickname']}** ({t['ovr']} OVR)\n"
-            f"💰 RPLCoin: `{t['money']}`"
-        )
-        await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
-
-async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_pm_registered(update, context):
-        return
-
-    query = update.callback_query
-    user = query.from_user
-    data = query.data
-
-    parts = data.split("_")
-    action = parts[1]
-    trade_id = int(parts[2])
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM trades WHERE id = %s AND status = 'pending'", (trade_id,))
-    trade = c.fetchone()
-
-    if not trade:
-        conn.close()
-        await query.answer("❌ Этот трейд уже неактивен или отменен!", show_alert=True)
-        try:
-            await query.message.edit_text("❌ Трейд неактивен.")
-        except Exception:
-            pass
-        return
-
-    if trade['receiver_id'] != user.id:
-        conn.close()
-        await query.answer("❌ Это предложение адресовано не вам!", show_alert=True)
-        return
-
-    if action == "decline":
-        c.execute("UPDATE trades SET status = 'declined' WHERE id = %s", (trade_id,))
-        conn.commit()
-        conn.close()
-        await query.answer("❌ Вы отклонили трейд.")
-        await query.message.edit_text("❌ Предложение обмена отклонено.")
-        return
-
-    if action == "accept":
-        sender_id = trade['sender_id']
-        card_id = trade['card_id']
-        money = trade['money']
-
-        # Проверяем наличие карточки у отправителя на момент принятия
-        c.execute("SELECT count FROM user_cards WHERE user_id = %s AND card_id = %s AND count > 0", (sender_id, card_id))
-        s_card = c.fetchone()
-        if not s_card:
-            conn.close()
-            await query.answer("❌ У отправителя больше нет этой карточки!", show_alert=True)
-            await query.message.edit_text("❌ Трейд отменен: карточка отсутствует у отправителя.")
-            c.execute("UPDATE trades SET status = 'cancelled' WHERE id = %s", (trade_id,))
-            conn.commit()
-            return
-
-        # Проверяем баланс отправителя для денег
-        c.execute("SELECT balance FROM users WHERE user_id = %s", (sender_id,))
-        s_user = c.fetchone()
-        if not s_user or s_user['balance'] < money:
-            conn.close()
-            await query.answer("❌ У отправителя недостаточно средств!", show_alert=True)
-            await query.message.edit_text("❌ Трейд отменен: недостаточно средств у отправителя.")
-            c.execute("UPDATE trades SET status = 'cancelled' WHERE id = %s", (trade_id,))
-            conn.commit()
-            return
-
-        # Проверяем баланс получателя (если вдруг требуется списание, но тут получатель получает карточку и деньги от отправителя)
-        # Проводка транзакции обмена:
-        # 1. Забираем карточку у отправителя
-        c.execute("UPDATE user_cards SET count = count - 1 WHERE user_id = %s AND card_id = %s", (sender_id, card_id))
-        c.execute("DELETE FROM user_cards WHERE user_id = %s AND card_id = %s AND count <= 0", (sender_id, card_id))
-
-        # 2. Выдаем карточку получателю
-        c.execute('''
-            INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1)
-            ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1
-        ''', (user.id, card_id))
-
-        # 3. Переводим деньги от отправителя получателю (если указаны)
-        if money > 0:
-            c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (money, sender_id))
-            c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (money, user.id))
-
-        c.execute("UPDATE trades SET status = 'accepted' WHERE id = %s", (trade_id,))
-        conn.commit()
-        conn.close()
-
-        await query.answer("🎉 Трейд успешно принят!")
-        await query.message.edit_text("✅ Вы успешно приняли обмен!")
-
-        try:
-            await context.bot.send_message(
-                chat_id=sender_id,
-                text=f"🎉 Игрок приняль ваш трейд (#{trade_id})! Обмен завершен успешно.",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-# ---------- ТОРГОВАЯ ПЛОЩАДКА /cardshop ----------
-async def cardshop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_pm_registered(update, context):
-        return
-
-    args = context.args
-    if args and args[0].lower() == "sell":
-        if len(args) < 3:
-            await update.message.reply_text("❌ Использование: `/cardshop sell ID_карточки цена` (цена до 999999)", parse_mode="Markdown")
-            return
-        card_id = int(args[1])
-        price = int(args[2])
-        if price <= 0 or price > 999999:
-            await update.message.reply_text("❌ Цена должна быть от 1 до 999999 RPLCoin!")
-            return
-
-        user = update.effective_user
-        conn = get_db()
-        c = conn.cursor()
-
-        # Проверяем наличие карточки
-        c.execute("SELECT count FROM user_cards WHERE user_id = %s AND card_id = %s AND count > 0", (user.id, card_id))
-        uc = c.fetchone()
-        if not uc:
-            conn.close()
-            await update.message.reply_text("❌ У вас нет этой карточки в инвентаре!")
-            return
-
-        # Снимаем 1 шт с инвентаря игрока
-        c.execute("UPDATE user_cards SET count = count - 1 WHERE user_id = %s AND card_id = %s", (user.id, card_id))
-        c.execute("DELETE FROM user_cards WHERE user_id = %s AND card_id = %s AND count <= 0", (user.id, card_id))
-
-        # Выставляем на торговую площадку
-        c.execute("INSERT INTO card_shop_listings (seller_id, card_id, price) VALUES (%s, %s, %s)", (user.id, card_id, price))
-        conn.commit()
-        conn.close()
-
-        await update.message.reply_text(f"✅ Карточка успешно выставлена на торговую площадку за `{price} RPLCoin`!", parse_mode="Markdown")
-        return
-
-    # Показываем список лотов
-    await show_cardshop_listings(update, context)
-
-async def show_cardshop_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user if query else update.effective_user
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''
-        SELECT l.*, cd.nickname, cd.ovr, cd.rarity, cd.position
-        FROM card_shop_listings l
-        JOIN cards cd ON l.card_id = cd.id
-        ORDER BY l.price ASC
-        LIMIT 15
-    ''')
-    listings = c.fetchall()
-    conn.close()
-
-    text = "🛍 **Торговая Площадка Карточек:**\n\nИспользуйте `/cardshop sell ID цена` для выставления своих карточек.\n\n"
-    buttons = []
-
-    if not listings:
-        text += "📭 На торговой площадке пока нет активных лотов."
-    else:
-        for l in listings:
-            text += f"Лот #{l['id']} | **{l['nickname']}** ({l['position']}, {l['ovr']} OVR, [{l['rarity']}] — `🎴 {l['price']} RPLCoin`\n"
-            buttons.append([InlineKeyboardButton(f"Купить #{l['id']} за {l['price']} RPLCoin", callback_data=f"buy_shop_{l['id']}")])
-
-    buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_cardshop")])
-    markup = InlineKeyboardMarkup(buttons)
-
-    if query:
-        await query.answer()
-        try:
-            await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-        except Exception:
-            await query.message.delete()
-            await context.bot.send_message(user.id, text, reply_markup=markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
-
-async def cardshop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_pm_registered(update, context):
-        return
-
-    query = update.callback_query
-    user = query.from_user
-    data = query.data
-
-    if data == "refresh_cardshop":
-        await show_cardshop_listings(update, context)
-        return
-
-    if data.startswith("buy_shop_"):
-        listing_id = int(data.split("_")[2])
-        conn = get_db()
-        c = conn.cursor()
-
-        c.execute("SELECT * FROM card_shop_listings WHERE id = %s", (listing_id,))
-        listing = c.fetchone()
-
-        if not listing:
-            conn.close()
-            await query.answer("❌ Этот лот уже продан или снят с продажи!", show_alert=True)
-            await show_cardshop_listings(update, context)
-            return
-
-        seller_id = listing['seller_id']
-        card_id = listing['card_id']
-        price = listing['price']
-
-        if seller_id == user.id:
-            conn.close()
-            await query.answer("❌ Вы не можете купить собственный лот!", show_alert=True)
-            return
-
-        # Проверяем баланс покупателя
-        c.execute("SELECT balance FROM users WHERE user_id = %s", (user.id,))
-        u_bal = c.fetchone()['balance']
-        if u_bal < price:
-            conn.close()
-            await query.answer("❌ У вас недостаточно RPLCoin для покупки этого лота!", show_alert=True)
-            return
-
-        # Проводим сделку
-        c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (price, user.id))
-        c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (price, seller_id))
-
-        # Выдаем карточку покупателю
-        c.execute('''
-            INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1)
-            ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1
-        ''', (user.id, card_id))
-
-        # Удаляем лот
-        c.execute("DELETE FROM card_shop_listings WHERE id = %s", (listing_id,))
-        conn.commit()
-        conn.close()
-
-        await query.answer("🎉 Карточка успешно куплена на торговой площадке!", show_alert=True)
-        await show_cardshop_listings(update, context)
-
-        try:
-            await context.bot.send_message(
-                chat_id=seller_id,
-                text=f"🛍 Ваша карточка (ID лота: #{listing_id}) успешно продана за `{price} RPLCoin`!",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-# ---------- СИСТЕМА ПРОМОКОДОВ (/promo) ----------
-async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_pm_registered(update, context):
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("🎟 Используйте: `/promo <код>` для активации промокода.", parse_mode="Markdown")
-        return
-
-    code = args[0].strip().upper()
-    user = update.effective_user
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM promos WHERE code = %s", (code,))
-    promo = c.fetchone()
-
-    if not promo:
-        conn.close()
-        await update.message.reply_text("❌ Промокод не найден или не существует.")
-        return
-
-    if promo['used_count'] >= promo['max_uses']:
-        conn.close()
-        await update.message.reply_text("❌ Лимит активаций этого промокода исчерпан!")
-        return
-
-    # Проверяем, активировал ли уже этот пользователь
-    c.execute("SELECT * FROM promo_activations WHERE user_id = %s AND code = %s", (user.id, code))
-    if c.fetchone():
-        conn.close()
-        await update.message.reply_text("❌ Вы уже активировали этот промокод!")
-        return
-
-    # Активируем промокод
-    c.execute("INSERT INTO promo_activations (user_id, code) VALUES (%s, %s)", (user.id, code))
-    c.execute("UPDATE promos SET used_count = used_count + 1 WHERE code = %s", (code,))
-
-    reward_type = promo['reward_type']
-    reward_val = promo['reward_value']
-
-    if reward_type == 'money':
-        c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (reward_val, user.id))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text(f"🎉 Промокод `{code}` успешно активирован!\nВы получили: **{reward_val} RPLCoin** 💳", parse_mode="Markdown")
-
-    elif reward_type == 'card':
-        card_id = reward_val
-        c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (user.id, card_id))
-        c.execute("SELECT nickname, ovr FROM cards WHERE id = %s", (card_id,))
-        cd = c.fetchone()
-        conn.commit()
-        conn.close()
-
-        c_name = cd['nickname'] if cd else f"ID {card_id}"
-        c_ovr = cd['ovr'] if cd else ""
-        await update.message.reply_text(f"🎉 Промокод `{code}` успешно активирован!\nВы получили карточку: **{c_name}** ({c_ovr} OVR) 🎴", parse_mode="Markdown")
-
 # ---------- МАТЧИ И ПОИСК СОПЕРНИКА (/cardmatch) ----------
-active_searches = {}
-active_games = set()
+active_searches = {}  # user_id: {chat_id, msg_id, username, first_name, start_time, task}
+active_games = set()  # Множество ID игроков в матче
 
 def calc_goal_probabilities(p1_cards, p2_cards):
+    """
+    Рассчитывает веса шанса забить гол с усиленным влиянием OVR,
+    чтобы топ-составы уверенно обыгрывали слабых игроков.
+    """
     p1_skater_ovr = sum(p1_cards[f"skater{i}"]["ovr"] for i in range(1, 5)) / 4.0
     p2_skater_ovr = sum(p2_cards[f"skater{i}"]["ovr"] for i in range(1, 5)) / 4.0
     
     g1_ovr = p1_cards["goalie"]["ovr"]
     g2_ovr = p2_cards["goalie"]["ovr"]
 
+    # Общие OVR команд
+    p1_tot_ovr = (p1_skater_ovr * 4.0 + g1_ovr) / 5.0
+    p2_tot_ovr = (p2_skater_ovr * 4.0 + g2_ovr) / 5.0
+
     diff1 = p1_skater_ovr - g2_ovr
     diff2 = p2_skater_ovr - g1_ovr
 
-    # Сильная экспоненциальная зависимость (1.8x фактор для реализации разницы OVR)
-    prob_p1 = 0.10 * (1.8 ** (diff1 / 8.0))
-    prob_p2 = 0.10 * (1.8 ** (diff2 / 8.0))
+    # Нелинейная крутая зависимость 1.8^x
+    if diff1 >= 0:
+        prob_p1 = 0.12 * (1.8 ** (diff1 / 7.0))
+    else:
+        prob_p1 = 0.12 * (0.5 ** (-diff1 / 7.0))
 
-    prob_p1 = max(0.01, min(0.35, prob_p1))
-    prob_p2 = max(0.01, min(0.35, prob_p2))
+    if diff2 >= 0:
+        prob_p2 = 0.12 * (1.8 ** (diff2 / 7.0))
+    else:
+        prob_p2 = 0.12 * (0.5 ** (-diff2 / 7.0))
+
+    # Корректировка по разнице общих OVR
+    tot_diff = p1_tot_ovr - p2_tot_ovr
+    if tot_diff > 10:
+        prob_p1 *= 1.5
+        prob_p2 *= 0.3
+    elif tot_diff < -10:
+        prob_p1 *= 0.3
+        prob_p2 *= 1.5
+
+    prob_p1 = max(0.005, min(0.45, prob_p1))
+    prob_p2 = max(0.005, min(0.45, prob_p2))
 
     return prob_p1, prob_p2
 
 def calc_shootout_prob(skater_ovr, goalie_ovr):
     diff = skater_ovr - goalie_ovr
-    prob = 0.30 * (1.6 ** (diff / 8.0))
-    return max(0.05, min(0.80, prob))
+    if diff >= 0:
+        prob = 0.35 * (1.6 ** (diff / 8.0))
+    else:
+        prob = 0.35 * (0.5 ** (-diff / 8.0))
+    return max(0.05, min(0.85, prob))
 
 async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -1525,7 +1880,7 @@ async def cardmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         f"🏒 Игрок **{user.first_name}** (@{user.username or user.id}) ищет соперника для матча!\n"
         f"🏆 MMR: **{u_data['mmr']}**\n\n"
-        f"Нажмите кнопку ниже или начните поиск `/cardmatch` в любом чате!",
+        f"Нажмите кнопку ниже или начните поиск `/cardmatch`!",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -1636,6 +1991,7 @@ def format_cards_list(cards_dict):
         lines.append(f"  • {label}: **{v['nickname']}** ({v['ovr']} OVR)")
     return "\n".join(lines)
 
+# --- Симуляция Хоккея (PvP) ---
 async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg_id, context):
     active_games.add(p1_id)
     active_games.add(p2_id)
@@ -1741,8 +2097,9 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
 
         await asyncio.sleep(2)
 
+        # ОВЕРТАЙМ
         if score1 == score2:
-            evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3 до золотого гола)!**"
+            evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3)!**"
             all_events.append(evt_ot_start)
             await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n\n{evt_ot_start}")
             await asyncio.sleep(4)
@@ -1759,29 +2116,38 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔴 {name1}! [{score1}:{score2}]"
                     all_events.append(evt)
                     break
-
                 elif rand_val < ot_prob1 + ot_prob2:
                     scorer = random.choice([p2_cards['skater1'], p2_cards['skater2']])
                     score2 += 1
                     evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔵 {name2}! [{score1}:{score2}]"
                     all_events.append(evt)
                     break
-
                 else:
-                    evt = f"🧤 **{ot_min}' СЕЙВ В ОВЕРТАЙМЕ!** Вратари на высоте!"
+                    evt = f"⚡️ **{ot_min}' ОПАСНЕЙШИЙ МОМЕНТ В ОВЕРТАЙМЕ!**"
                     all_events.append(evt)
 
                 recent_events = "\n".join(all_events[-6:])
-                await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n⏱ **ОВЕРТАЙМ**\n\n{recent_events}")
+                status_text = (
+                    f"{header}\n"
+                    f"📊 **Счет:** 🔴 {score1} — {score2} 🔵\n"
+                    f"⏱ **ОВЕРТАЙМ (3х3)**\n"
+                    f"📝 **Ход матча:**\n{recent_events}"
+                )
+                await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, status_text)
                 await asyncio.sleep(3.5)
 
+        await asyncio.sleep(2)
+
+        # СЕРИЯ БУЛЛИТОВ
         if score1 == score2:
-            evt_so_start = "🏒 **ОВЕРТАЙМ НЕ ВЫЯВИЛ ПОБЕДИТЕЛЯ! Начинается СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ!**"
+            evt_so_start = "🏒 **СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ!**"
             all_events.append(evt_so_start)
             await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🔵\n\n{evt_so_start}")
             await asyncio.sleep(4)
 
-            so_score1, so_score2 = 0, 0
+            so_score1 = 0
+            so_score2 = 0
+
             for round_num in range(1, 4):
                 sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
                 p1_prob = calc_shootout_prob(sk1['ovr'], p2_cards['goalie']['ovr'])
@@ -1790,6 +2156,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     evt1 = f"🎯 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **ГОЛ!** [{so_score1}:{so_score2}]"
                 else:
                     evt1 = f"🚫 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **СЕЙВ!** [{so_score1}:{so_score2}]"
+                
                 all_events.append(evt1)
 
                 sk2 = random.choice([p2_cards['skater1'], p2_cards['skater2'], p2_cards['skater3'], p2_cards['skater4']])
@@ -1799,10 +2166,10 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
                     evt2 = f"🎯 **Буллит #{round_num} 🔵 {name2}**: {sk2['nickname']} — **ГОЛ!** [{so_score1}:{so_score2}]"
                 else:
                     evt2 = f"🚫 **Буллит #{round_num} 🔵 {name2}**: {sk2['nickname']} — **СЕЙВ!** [{so_score1}:{so_score2}]"
-                all_events.append(evt2)
 
+                all_events.append(evt2)
                 recent_events = "\n".join(all_events[-6:])
-                await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ**\n📊 Буллиты: 🔴 {so_score1} — {so_score2} 🔵\n\n{recent_events}")
+                await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ (Раунд {round_num}/3)**\n📊 Буллиты: 🔴 {so_score1} — {so_score2} 🔵\n\n{recent_events}")
                 await asyncio.sleep(3)
 
             if so_score1 > so_score2:
@@ -1816,11 +2183,11 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
         c = conn.cursor()
 
         if score1 > score2:
-            res_text = f"🎉 **ПОБЕДА 🔴 {name1}!**\nИтоговый счет: **{score1} - {score2}**"
+            res_text = f"🎉 **ПОБЕДА 🔴 {name1}!**\nИтоговый счет (с Уч. ОВ/Б): **{score1} - {score2}**"
             apply_match_rewards(c, p1_id, is_win=True)
             apply_match_rewards(c, p2_id, is_win=False)
         else:
-            res_text = f"🎉 **ПОБЕДА 🔵 {name2}!**\nИтоговый счет: **{score1} - {score2}**"
+            res_text = f"🎉 **ПОБЕДА 🔵 {name2}!**\nИтоговый счет (с Уч. ОВ/Б): **{score1} - {score2}**"
             apply_match_rewards(c, p2_id, is_win=True)
             apply_match_rewards(c, p1_id, is_win=False)
 
@@ -1832,7 +2199,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
             f"{res_text}\n\n"
             f"🏆 Победитель получил: **+50 MMR** и **+2000 RPLCoin**\n"
             f"🥈 Проигравший получил: **-50 MMR** и **+500 RPLCoin**\n\n"
-            f"📋 **Протокол игры:**\n" + "\n".join(all_events)
+            f"📋 **Полный протокол игры:**\n" + "\n".join(all_events)
         )
 
         await broadcast_match_text(context, p1_chat_id, p1_msg_id, p2_chat_id, p2_msg_id, final_text)
@@ -1841,6 +2208,7 @@ async def start_game_pvp(p1_id, p2_id, p1_chat_id, p2_chat_id, p1_msg_id, p2_msg
         active_games.discard(p1_id)
         active_games.discard(p2_id)
 
+# --- Симуляция Хоккея (Против ИИ Бота) ---
 async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
     active_games.add(p1_id)
     try:
@@ -1887,6 +2255,7 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
             }
 
         ai_ovr = sum(cd['ovr'] for cd in ai_cards.values()) / 5.0
+
         name1 = u1['first_name'] or u1['username'] or str(p1_id)
 
         roster1_text = format_cards_list(p1_cards)
@@ -1905,13 +2274,16 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
 
         score1, score2 = 0, 0
         all_events = []
+
         prob_p1, prob_ai = calc_goal_probabilities(p1_cards, ai_cards)
 
         for period in range(1, 4):
             period_header = f"⏱ **ПЕРИОД {period}**\n"
+
             for tick in range(1, 4):
                 minute = (period - 1) * 20 + tick * 6 + random.randint(-1, 2)
                 minute = min(60, max(1, minute))
+
                 rand_val = random.random()
 
                 if rand_val < prob_p1:
@@ -1919,19 +2291,30 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
                     score1 += 1
                     evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']} забивает за🔴 {name1}! [{score1}:{score2}]"
                     all_events.append(evt)
+
                 elif rand_val < prob_p1 + prob_ai:
                     scorer = random.choice([ai_cards['skater1'], ai_cards['skater2'], ai_cards['skater3'], ai_cards['skater4']])
                     score2 += 1
                     evt = f"⚡️ **{minute}' ГОЛ!** {scorer['nickname']} (ИИ Бот) забивает за🤖 ИИ Бота! [{score1}:{score2}]"
                     all_events.append(evt)
+
                 else:
-                    evt = f"🧤 **{minute}' СЕЙВ!** Вратари надежны!"
+                    event_type = random.choice(["save1", "save2", "post", "hit"])
+                    if event_type == "save1":
+                        evt = f"🧤 **{minute}' СЕЙВ!** {p1_cards['goalie']['nickname']} забирает шайбу!"
+                    elif event_type == "save2":
+                        evt = f"🧤 **{minute}' СЕЙВ!** ИИ Вратарь отражает опасный бросок!"
+                    elif event_type == "post":
+                        evt = f"🏒 **{minute}' ШТАНГА!** Мощный щелчок сотрясает ворота!"
+                    else:
+                        evt = f"💥 **{minute}' СИЛОВОЙ ПРИЕМ!** Игроки сошлись у борта!"
+
                     all_events.append(evt)
 
                 recent_events = "\n".join(all_events[-6:])
                 status_text = (
                     f"{header}\n"
-                    f"📊 **Счет:** 🔴 {score1} — {score2} 🤖\n"
+                    f"📊 **Текущий Счет:** 🔴 {score1} — {score2} 🤖\n"
                     f"{period_header}\n"
                     f"📝 **Ход матча:**\n{recent_events}"
                 )
@@ -1939,11 +2322,79 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
                 await asyncio.sleep(3.5)
 
         await asyncio.sleep(2)
+
         if score1 == score2:
-            score1 += 1 # Буллитная развязка в пользу игрока при ничьей с ботом
+            evt_ot_start = "⏳ **ОСНОВНОЕ ВРЕМЯ ЗАВЕРШЕНО СО СЧЕТОМ " + f"{score1}:{score2}! Начинается ОВЕРТАЙМ (5 минут, 3х3)!**"
+            all_events.append(evt_ot_start)
+            await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🤖\n\n{evt_ot_start}")
+            await asyncio.sleep(4)
+
+            ot_prob1 = prob_p1 * 0.8
+            ot_prob2 = prob_ai * 0.8
+
+            for ot_min in range(61, 66):
+                rand_val = random.random()
+
+                if rand_val < ot_prob1:
+                    scorer = random.choice([p1_cards['skater1'], p1_cards['skater2']])
+                    score1 += 1
+                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🔴 {name1}! [{score1}:{score2}]"
+                    all_events.append(evt)
+                    break
+                elif rand_val < ot_prob1 + ot_prob2:
+                    scorer = random.choice([ai_cards['skater1'], ai_cards['skater2']])
+                    score2 += 1
+                    evt = f"🔥 **{ot_min}' ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!** {scorer['nickname']} приносит победу 🤖 ИИ Боту! [{score1}:{score2}]"
+                    all_events.append(evt)
+                    break
+                else:
+                    evt = f"🧤 **{ot_min}' ОПАСНЫЙ МОМЕНТ В ОВЕРТАЙМЕ!**"
+                    all_events.append(evt)
+
+                recent_events = "\n".join(all_events[-6:])
+                await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n📊 **Счет:** 🔴 {score1} — {score2} 🤖\n⏱ **ОВЕРТАЙМ**\n\n{recent_events}")
+                await asyncio.sleep(3.5)
+
+        if score1 == score2:
+            evt_so_start = "🏒 **СЕРИЯ ПОСЛЕМАТЧЕВЫХ БУЛЛИТОВ ПРОТИВ ИИ БОТА!**"
+            all_events.append(evt_so_start)
+            await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n\n{evt_so_start}")
+            await asyncio.sleep(4)
+
+            so_score1, so_score2 = 0, 0
+            for round_num in range(1, 4):
+                sk1 = random.choice([p1_cards['skater1'], p1_cards['skater2'], p1_cards['skater3'], p1_cards['skater4']])
+                p1_prob = calc_shootout_prob(sk1['ovr'], ai_cards['goalie']['ovr'])
+                if random.random() < p1_prob:
+                    so_score1 += 1
+                    evt1 = f"🎯 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **ГОЛ!** [{so_score1}:{so_score2}]"
+                else:
+                    evt1 = f"🚫 **Буллит #{round_num} 🔴 {name1}**: {sk1['nickname']} — **СЕЙВ!** [{so_score1}:{so_score2}]"
+                all_events.append(evt1)
+
+                sk2 = random.choice([ai_cards['skater1'], ai_cards['skater2'], ai_cards['skater3'], ai_cards['skater4']])
+                ai_prob = calc_shootout_prob(sk2['ovr'], p1_cards['goalie']['ovr'])
+                if random.random() < ai_prob:
+                    so_score2 += 1
+                    evt2 = f"🎯 **Буллит #{round_num} 🤖 ИИ Бот**: {sk2['nickname']} — **ГОЛ!** [{so_score1}:{so_score2}]"
+                else:
+                    evt2 = f"🚫 **Буллит #{round_num} 🤖 ИИ Бот**: {sk2['nickname']} — **СЕЙВ!** [{so_score1}:{so_score2}]"
+                all_events.append(evt2)
+
+                recent_events = "\n".join(all_events[-6:])
+                await broadcast_match_text(context, chat_id, msg_id, None, None, f"{header}\n🎯 **СЕРИЯ БУЛЛИТОВ**\n📊 Буллиты: 🔴 {so_score1} — {so_score2} 🤖\n\n{recent_events}")
+                await asyncio.sleep(3)
+
+            if so_score1 > so_score2:
+                score1 += 1
+            else:
+                score2 += 1
+
+        await asyncio.sleep(2)
 
         conn = get_db()
         c = conn.cursor()
+
         if score1 > score2:
             res_text = f"🎉 **ПОБЕДА НАД ИИ БОТОМ!**\nИтоговый счет: **{score1} - {score2}**"
             apply_match_rewards(c, p1_id, is_win=True)
@@ -1954,7 +2405,12 @@ async def start_game_vs_ai(p1_id, chat_id, msg_id, context):
         conn.commit()
         conn.close()
 
-        final_text = f"🏁 **МАТЧ ЗАВЕРШЕН!**\n\n{res_text}\n\n📋 **Протокол:**\n" + "\n".join(all_events)
+        final_text = (
+            f"🏁 **МАТЧ ЗАВЕРШЕН!**\n\n"
+            f"{res_text}\n\n"
+            f"📋 **Протокол игры:**\n" + "\n".join(all_events)
+        )
+
         await broadcast_match_text(context, chat_id, msg_id, None, None, final_text)
 
     finally:
@@ -1975,10 +2431,12 @@ def get_roster_cards(cursor, roster):
 def apply_match_rewards(cursor, user_id, is_win):
     if is_win is True:
         cursor.execute("UPDATE users SET mmr = mmr + 50, balance = balance + 2000 WHERE user_id = %s", (user_id,))
-    else:
+    elif is_win is False:
         cursor.execute("UPDATE users SET mmr = GREATEST(0, mmr - 50), balance = balance + 500 WHERE user_id = %s", (user_id,))
+    else:
+        cursor.execute("UPDATE users SET balance = balance + 500 WHERE user_id = %s", (user_id,))
 
-# ---------- ТОП MMR (/cardmmr) ----------
+# ---------- ТОР MMR (/cardmmr) ----------
 async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -2001,7 +2459,7 @@ async def cardmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ---------- МАГАЗИН И ПАКЕТЫ С ПРЕДПРОСМОТРОМ (/shop) ----------
+# ---------- МАГАЗИН И ПАКИ (/shop) ----------
 async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
         return
@@ -2018,9 +2476,9 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c = conn.cursor()
     c.execute("SELECT * FROM packs")
     packs = c.fetchall()
-    conn.close()
 
     if not packs:
+        conn.close()
         text = "🛒 **Магазин Паков пуст.** Администратор скоро добавит новые паки!"
         if query:
             await query.answer()
@@ -2029,11 +2487,19 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text)
         return
 
-    text = "🛒 **МАГАЗИН ПАКОВ КАРТОЧЕК:**\nВыберите пак для подробной информации и покупки:"
+    text = "🛒 **МАГАЗИН ПАКОВ КАРТОЧЕК:**\n\nВыберите пак для предварительного просмотра и покупки:\n\n"
     buttons = []
 
     for p in packs:
-        buttons.append([InlineKeyboardButton(f"📦 {p['name']} — {p['price']} RPLCoin", callback_data=f"preview_pack_{p['id']}")])
+        c.execute("SELECT buy_count FROM user_pack_buys WHERE user_id = %s AND pack_id = %s", (user.id, p['id']))
+        b_row = c.fetchone()
+        b_count = b_row['buy_count'] if b_row else 0
+
+        lim_str = f"{b_count}/{p['buy_limit']}" if p['buy_limit'] > 0 else "Безлимит"
+        text += f"📦 **{p['name']}** — `{p['price']} RPLCoin` (Куплено: {lim_str})\n"
+        buttons.append([InlineKeyboardButton(f"📦 {p['name']} ({p['price']} RPLCoin)", callback_data=f"preview_pack_{p['id']}")])
+
+    conn.close()
 
     markup = InlineKeyboardMarkup(buttons)
     if query:
@@ -2054,51 +2520,66 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     user = query.from_user
     data = query.data
 
-    if data == "shop_back":
-        await show_shop(update, context)
-        return
-
     if data.startswith("preview_pack_"):
         pack_id = int(data.split("_")[2])
         conn = get_db()
         c = conn.cursor()
+
         c.execute("SELECT * FROM packs WHERE id = %s", (pack_id,))
         pack = c.fetchone()
+
+        if not pack:
+            conn.close()
+            await query.answer("❌ Пак не найден!", show_alert=True)
+            return
 
         c.execute("SELECT buy_count FROM user_pack_buys WHERE user_id = %s AND pack_id = %s", (user.id, pack_id))
         b_row = c.fetchone()
         b_count = b_row['buy_count'] if b_row else 0
+        lim_str = f"{b_count}/{pack['buy_limit']}" if pack['buy_limit'] > 0 else "Безлимит"
+
+        c.execute('''
+            SELECT c.nickname, c.ovr, c.rarity, c.position
+            FROM pack_cards pc
+            JOIN cards c ON pc.card_id = c.id
+            WHERE pc.pack_id = %s
+        ''', (pack_id,))
+        p_cards = c.fetchall()
         conn.close()
 
-        if not pack:
-            await query.answer("❌ Пак не найден!", show_alert=True)
-            return
+        cards_str = ""
+        for pc in p_cards:
+            cards_str += f"  • **{pc['nickname']}** ({pc['position']}, {pc['ovr']} OVR) [{pc['rarity']}]\n"
 
-        lim_str = f"{b_count}/{pack['buy_limit']}" if pack['buy_limit'] > 0 else "Безлимит"
-        text = (
-            f"📦 **Пак: {pack['name']}**\n\n"
+        caption = (
+            f"📦 **ПРЕДПРОСМОТР ПАКА «{pack['name']}»**\n\n"
             f"💰 Цена: **{pack['price']} RPLCoin**\n"
-            f"📊 Куплено: `{lim_str}`\n\n"
-            f"Подтвердите покупку пака:"
+            f"🔢 Лимит покупок: **{lim_str}**\n\n"
+            f"🃏 **Возможные карточки в паке:**\n{cards_str or '  *(карточки не указаны)*'}\n"
+            f"Подтвердите покупку ниже:"
         )
 
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Подтвердить покупку", callback_data=f"buy_pack_{pack['id']}")],
-            [InlineKeyboardButton("🔙 Назад в магазин", callback_data="shop_back")]
+            [InlineKeyboardButton("✅ Подтвердить покупку", callback_data=f"confirm_pack_{pack_id}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_pack_buy")]
         ])
+
+        await query.answer()
 
         if pack['photo_id']:
             try:
                 await query.message.delete()
-                await context.bot.send_photo(chat_id=user.id, photo=pack['photo_id'], caption=text, reply_markup=kb, parse_mode="Markdown")
+                await context.bot.send_photo(chat_id=user.id, photo=pack['photo_id'], caption=caption, reply_markup=kb, parse_mode="Markdown")
                 return
             except Exception:
                 pass
 
-        await query.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
-        return
+        await query.message.edit_text(caption, reply_markup=kb, parse_mode="Markdown")
 
-    if data.startswith("buy_pack_"):
+    elif data == "cancel_pack_buy":
+        await show_shop(update, context)
+
+    elif data.startswith("confirm_pack_"):
         pack_id = int(data.split("_")[2])
         conn = get_db()
         c = conn.cursor()
@@ -2135,17 +2616,11 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ В этом паке нет карточек!", show_alert=True)
             return
 
+        # Защита от дубликатов
         chosen_card = choose_card_for_user(c, user.id, p_cards)
         chosen_card_id = chosen_card['id']
 
-        # Анимация открытия пака (3 секунды)
-        await query.answer("📦 Идет открытие пака... ⏳")
-        try:
-            await query.message.edit_text("📦 **Идет вскрытие пака и розыгрыш карточки...** ⏳", parse_mode="Markdown")
-        except Exception:
-            pass
-        await asyncio.sleep(3)
-
+        # Начисление и списание
         c.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s", (pack['price'], user.id))
         c.execute('''
             INSERT INTO user_pack_buys (user_id, pack_id, buy_count) VALUES (%s, %s, 1)
@@ -2168,6 +2643,17 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         conn.commit()
         conn.close()
 
+        await query.answer("🎉 Пак успешно приобретен!", show_alert=True)
+
+        # Отправка анимации открытия на 3 секунды
+        temp_msg = await context.bot.send_message(chat_id=user.id, text="⏳ **Идет открытие пака...**", parse_mode="Markdown")
+        await asyncio.sleep(3)
+
+        try:
+            await context.bot.delete_message(chat_id=user.id, message_id=temp_msg.message_id)
+        except Exception:
+            pass
+
         team_str = f"{card['team_emoji'] or '🏒'} {card['team_name']}" if card['team_name'] else "Без команды"
         caption = (
             f"📦 **Из пака «{pack['name']}» вам выпала карточка!**\n\n"
@@ -2181,20 +2667,17 @@ async def shop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             f"┗━━━━━━━━━━━━━━━━━━━━┛"
         )
 
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-
         if card['image_id']:
             try:
                 await context.bot.send_photo(chat_id=user.id, photo=card['image_id'], caption=caption, parse_mode="Markdown")
-                return
             except Exception:
-                pass
-        await context.bot.send_message(chat_id=user.id, text=caption, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=user.id, text=caption, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=user.id, text=caption, parse_mode="Markdown")
 
-# ---------- АДМИН-ПАНЕЛЬ КАРТОЧЕК И ПРОМОКОДОВ ----------
+        await show_shop(update, context)
+
+# ---------- АДМИН-ПАНЕЛЬ КАРТОЧЕК И ПАКОВ ----------
 async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
@@ -2235,12 +2718,16 @@ async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_
         return ADD_PACK_NAME
 
     elif text == "🎁 Выдать карточку игроку":
-        await update.message.reply_text("🎁 Введите ID/@username пользователя и ID карточки через пробел:", parse_mode="Markdown")
+        await update.message.reply_text("🎁 Введите ID/@username пользователя и ID карточки через пробел (например: `@username 5` или `123456789 5`):", parse_mode="Markdown")
         return GRANT_CARD_DATA
 
     elif text == "💰 Выдать деньги":
-        await update.message.reply_text("💰 Введите @username пользователя и сумму через пробел:", parse_mode="Markdown")
+        await update.message.reply_text("💰 Введите @username пользователя и сумму через пробел (например: `@username 5000`):", parse_mode="Markdown")
         return GIVE_MONEY_DATA
+
+    elif text == "🎟 Создать промокод":
+        await admin_create_promo_start(update, context)
+        return ADD_PROMO_CODE
 
     elif text == "⬅️ Выйти из настройки карточек":
         await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
@@ -2248,63 +2735,7 @@ async def admin_card_menu_handler(update: Update, context: ContextTypes.DEFAULT_
 
     return CARD_ADMIN_MENU
 
-# --- Создание промокода (через админку) ---
-async def start_create_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    await update.message.reply_text("🎟 Введите текстовый промокод (например `RPL2026`):", reply_markup=ReplyKeyboardRemove())
-    return ADD_PROMO_CODE
-
-async def promo_set_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["promo_code"] = update.message.text.strip().upper()
-    kb = [["Деньги (RPLCoin)", "Карточка"]]
-    await update.message.reply_text("📌 Выберите тип награды за промокод:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    return ADD_PROMO_TYPE
-
-async def promo_set_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t_text = update.message.text.strip()
-    if "Деньги" in t_text:
-        context.user_data["promo_type"] = "money"
-        await update.message.reply_text("💰 Введите сумму RPLCoin для награды:", reply_markup=ReplyKeyboardRemove())
-    else:
-        context.user_data["promo_type"] = "card"
-        await update.message.reply_text("🎴 Введите ID карточки для награды:", reply_markup=ReplyKeyboardRemove())
-    return ADD_PROMO_REWARD
-
-async def promo_set_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = int(update.message.text.strip())
-        context.user_data["promo_reward"] = val
-        await update.message.reply_text("🔢 Введите общее количество активаций (лимит использования промокода среди всех игроков):")
-        return ADD_PROMO_LIMIT
-    except ValueError:
-        await update.message.reply_text("❌ Введите числовое значение!")
-        return ADD_PROMO_REWARD
-
-async def promo_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        max_uses = int(update.message.text.strip())
-        code = context.user_data.get("promo_code")
-        r_type = context.user_data.get("promo_type")
-        r_val = context.user_data.get("promo_reward")
-
-        conn = get_db()
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO promos (code, reward_type, reward_value, max_uses, used_count)
-            VALUES (%s, %s, %s, %s, 0)
-            ON CONFLICT (code) DO UPDATE SET reward_type = EXCLUDED.reward_type, reward_value = EXCLUDED.reward_value, max_uses = EXCLUDED.max_uses
-        ''', (code, r_type, r_val, max_uses))
-        conn.commit()
-        conn.close()
-
-        await update.message.reply_text(f"✅ Промокод **{code}** успешно создан!\nТип: `{r_type}` | Награда: `{r_val}` | Лимит: `{max_uses}` активаций.", reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text("❌ Введите лимит числом!", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-
-# --- Стандартные функции создания коллекций/команд/карт/паков ---
+# --- Создание коллекции ---
 async def save_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     conn = get_db()
@@ -2318,18 +2749,22 @@ async def save_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     return CARD_ADMIN_MENU
 
+# --- Создание команды ---
 async def save_team_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["team_name"] = update.message.text.strip()
-    await update.message.reply_text("🏒 Введите эмодзи для команды:")
+    await update.message.reply_text("🏒 Введите один эмодзи/смайлик для команды (например 🟢 или 🏒):")
     return ADD_TEAM_EMOJI
 
 async def save_team_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["team_emoji"] = update.message.text.strip()
-    await update.message.reply_text("🖼 Отправьте фото команды (или `-`):")
+    await update.message.reply_text("🖼 Отправьте логотип/фото графику команды (или введите `-` чтобы пропустить):")
     return ADD_TEAM_PHOTO
 
 async def save_team_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo_id = update.message.photo[-1].file_id if update.message.photo else None
+    photo_id = None
+    if update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+
     name = context.user_data.get("team_name")
     emoji = context.user_data.get("team_emoji", "🏒")
 
@@ -2338,7 +2773,7 @@ async def save_team_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         c.execute("INSERT INTO card_teams (name, emoji, photo_id) VALUES (%s, %s, %s)", (name, emoji, photo_id))
         conn.commit()
-        await update.message.reply_text(f"✅ Команда {emoji} **{name}** создана!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Команда {emoji} **{name}** успешно создана!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
     except Exception:
         await update.message.reply_text("❌ Ошибка при создании команды.", reply_markup=card_admin_keyboard())
     conn.close()
@@ -2358,8 +2793,10 @@ async def delete_team_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text("✅ Команда удалена!")
     return CARD_ADMIN_MENU
 
+# --- Создание карточки ---
 async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["c_rarity"] = update.message.text.strip()
+    
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT * FROM collections")
@@ -2367,7 +2804,7 @@ async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not cols:
-        await update.message.reply_text("❌ Создайте коллекцию!", reply_markup=card_admin_keyboard())
+        await update.message.reply_text("❌ Сначала создайте коллекцию!", reply_markup=card_admin_keyboard())
         return CARD_ADMIN_MENU
 
     buttons = [[c_row['name']] for c_row in cols]
@@ -2376,8 +2813,9 @@ async def card_set_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def card_set_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["c_collection"] = update.message.text.strip()
+    
     kb = [COUNTRIES[i:i+3] for i in range(0, len(COUNTRIES), 3)]
-    await update.message.reply_text("🌍 Выберите страну:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    await update.message.reply_text("🌍 Выберите страну игрока:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return ADD_CARD_COUNTRY
 
 async def card_set_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2388,6 +2826,7 @@ async def card_set_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def card_set_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["c_position"] = update.message.text.strip()
+    
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT * FROM card_teams")
@@ -2396,31 +2835,39 @@ async def card_set_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = [[f"{t['emoji']} {t['name']}"] for t in teams]
     buttons.append(["Без команды"])
-    await update.message.reply_text("🛡 Выберите команду:", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
+
+    await update.message.reply_text("🛡 Выберите команду игрока:", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
     return ADD_CARD_TEAM
 
 async def card_set_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["c_team"] = update.message.text.strip()
-    await update.message.reply_text("🏷 Введите NickName игрока:", reply_markup=ReplyKeyboardRemove())
+    t_text = update.message.text.strip()
+    context.user_data["c_team"] = t_text
+
+    await update.message.reply_text("🏷 Введите NickName игрока и номер (например: `miulio #11`):", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
     return ADD_CARD_NICK
 
 async def card_set_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["c_nick"] = update.message.text.strip()
-    await update.message.reply_text("⭐ Введите OVR (50-99):")
+    await update.message.reply_text("⭐ Введите рейтинг OVR (число от 50 до 99):")
     return ADD_CARD_OVR
 
 async def card_set_ovr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ovr = int(update.message.text.strip())
         context.user_data["c_ovr"] = ovr
-        await update.message.reply_text("🖼 Отправьте фото или GIF карточки:")
+        await update.message.reply_text("🖼 Отправьте фотографию или GIF карточки:")
         return ADD_CARD_PHOTO
     except ValueError:
         await update.message.reply_text("❌ Введите OVR числом!")
         return ADD_CARD_OVR
 
 async def card_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo_id = update.message.photo[-1].file_id if update.message.photo else (update.message.animation.file_id if update.message.animation else None)
+    photo_id = None
+    if update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+    elif update.message.animation:
+        photo_id = update.message.animation.file_id
+
     rarity = context.user_data.get("c_rarity")
     col_name = context.user_data.get("c_collection")
     country = context.user_data.get("c_country")
@@ -2452,9 +2899,10 @@ async def card_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(f"✅ Карточка создана! ID: `{new_card_id}`", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
+    await update.message.reply_text(f"✅ **Карточка создана!**\n🆔 ID карточки: `{new_card_id}`\n👤 Игрок: {nick} ({ovr} OVR)", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
     return CARD_ADMIN_MENU
 
+# --- Удаление карточки ---
 async def delete_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         card_id = int(update.message.text.strip())
@@ -2468,6 +2916,7 @@ async def delete_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Введите ID числом!", reply_markup=card_admin_keyboard())
     return CARD_ADMIN_MENU
 
+# --- Создание пака ---
 async def pack_set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["p_name"] = update.message.text.strip()
     await update.message.reply_text("💰 Введите цену пака в RPLCoin:")
@@ -2475,8 +2924,9 @@ async def pack_set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pack_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        context.user_data["p_price"] = int(update.message.text.strip())
-        await update.message.reply_text("🔢 Введите лимит покупок (0 = безлимит):")
+        price = int(update.message.text.strip())
+        context.user_data["p_price"] = price
+        await update.message.reply_text("🔢 Введите лимит покупок пака на одного игрока (0 = безлимит):")
         return ADD_PACK_LIMIT
     except ValueError:
         await update.message.reply_text("❌ Введите цену числом!")
@@ -2484,8 +2934,9 @@ async def pack_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pack_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        context.user_data["p_limit"] = int(update.message.text.strip())
-        await update.message.reply_text("🆔 Введите ID карточек через пробел (до 10 ID):")
+        lim = int(update.message.text.strip())
+        context.user_data["p_limit"] = lim
+        await update.message.reply_text("🆔 Введите ID карточек для этого пака через пробел (до 10 ID):\nПример: `1 2 5 12`", parse_mode="Markdown")
         return ADD_PACK_CARDS
     except ValueError:
         await update.message.reply_text("❌ Введите лимит числом!")
@@ -2494,15 +2945,21 @@ async def pack_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pack_set_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         card_ids = [int(x) for x in update.message.text.strip().split()]
+        if len(card_ids) > 10:
+            await update.message.reply_text("❌ В паке не может быть более 10 карточек!")
+            return ADD_PACK_CARDS
         context.user_data["p_cards"] = card_ids
-        await update.message.reply_text("🖼 Отправьте обложку пака (фото):")
+        await update.message.reply_text("🖼 Отправьте фото/анимацию для обложки пака:")
         return ADD_PACK_PHOTO
     except ValueError:
         await update.message.reply_text("❌ Введите ID карточек через пробел!")
         return ADD_PACK_CARDS
 
 async def pack_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo_id = update.message.photo[-1].file_id if update.message.photo else None
+    photo_id = None
+    if update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+
     name = context.user_data.get("p_name")
     price = context.user_data.get("p_price")
     limit = context.user_data.get("p_limit")
@@ -2519,9 +2976,11 @@ async def pack_save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn.commit()
     conn.close()
+
     await update.message.reply_text(f"✅ Пак **{name}** создан!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
     return CARD_ADMIN_MENU
 
+# --- Выдача карточки ---
 async def grant_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         parts = update.message.text.strip().split()
@@ -2530,15 +2989,28 @@ async def grant_card_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         conn = get_db()
         c = conn.cursor()
-        target_id = int(user_input) if user_input.isdigit() else (c.execute("SELECT user_id FROM users WHERE username = %s", (user_input,)) or c.fetchone()['user_id'])
+
+        if user_input.isdigit():
+            target_id = int(user_input)
+        else:
+            c.execute("SELECT user_id FROM users WHERE username = %s", (user_input,))
+            u_row = c.fetchone()
+            if not u_row:
+                conn.close()
+                await update.message.reply_text("❌ Пользователь не найден!", reply_markup=card_admin_keyboard())
+                return CARD_ADMIN_MENU
+            target_id = u_row['user_id']
+
         c.execute("INSERT INTO user_cards (user_id, card_id, count) VALUES (%s, %s, 1) ON CONFLICT (user_id, card_id) DO UPDATE SET count = user_cards.count + 1", (target_id, card_id))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ Выдано!", reply_markup=card_admin_keyboard())
+
+        await update.message.reply_text(f"✅ Пользователю {target_id} выдана карточка ID {card_id}!", reply_markup=card_admin_keyboard())
     except Exception:
-        await update.message.reply_text("❌ Ошибка формата!", reply_markup=card_admin_keyboard())
+        await update.message.reply_text("❌ Неверный формат! Введите: `@username ID`", reply_markup=card_admin_keyboard())
     return CARD_ADMIN_MENU
 
+# --- Выдача денег ---
 async def give_money_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         parts = update.message.text.strip().split()
@@ -2547,28 +3019,35 @@ async def give_money_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         conn = get_db()
         c = conn.cursor()
-        c.execute("UPDATE users SET balance = balance + %s WHERE username = %s", (amount, username))
+        c.execute("UPDATE users SET balance = balance + %s WHERE username = %s RETURNING user_id", (amount, username))
+        row = c.fetchone()
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ Зачислено!", reply_markup=card_admin_keyboard())
+
+        if row:
+            await update.message.reply_text(f"✅ Пользователю @{username} зачислено **{amount} RPLCoin**!", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ Пользователь не найден!", reply_markup=card_admin_keyboard())
     except Exception:
-        await update.message.reply_text("❌ Ошибка формата!", reply_markup=card_admin_keyboard())
+        await update.message.reply_text("❌ Неверный формат! Введите: `@username сумма`", reply_markup=card_admin_keyboard())
     return CARD_ADMIN_MENU
 
-# ---------- ПРОСМОТР ИГРОКОВ В АДМИНКЕ ----------
+# ---------- АДМИН: ПРОСМОТР ИГРОКОВ И ИНВЕНТАРЯ ----------
 async def admin_view_inventory_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text.strip().replace("@", "")
     conn = get_db()
     c = conn.cursor()
+
     if user_input.isdigit():
         c.execute("SELECT * FROM users WHERE user_id = %s", (int(user_input),))
     else:
         c.execute("SELECT * FROM users WHERE username = %s", (user_input,))
+
     target_user = c.fetchone()
 
     if not target_user:
         conn.close()
-        await update.message.reply_text("❌ Игрок не найден!", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text("❌ Игрок с таким username/ID не найден!", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
 
     target_id = target_user['user_id']
@@ -2579,15 +3058,32 @@ async def admin_view_inventory_execute(update: Update, context: ContextTypes.DEF
         JOIN collections col ON c.collection_id = col.id
         LEFT JOIN card_teams t ON c.team_id = t.id
         WHERE uc.user_id = %s AND uc.count > 0
+        ORDER BY col.name, c.ovr DESC
     ''', (target_id,))
     user_cards = c.fetchall()
     conn.close()
 
-    text = f"🎒 Инвентарь @{target_user.get('username') or target_id}:\n"
-    for uc in user_cards:
-        text += f"ID `{uc['id']}` | **{uc['nickname']}** ({uc['ovr']} OVR) — `x{uc['count']}`\n"
+    uname = f"@{target_user['username']}" if target_user['username'] else target_user['first_name']
+    text = (
+        f"🎒 **Инвентарь игрока {uname}** (`ID: {target_id}`):\n"
+        f"💳 Баланс: **{target_user['balance']} RPLCoin** | 🏆 MMR: **{target_user['mmr']}**\n\n"
+    )
 
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+    if not user_cards:
+        text += "📭 У игрока нет карточек в инвентаре."
+    else:
+        for uc in user_cards:
+            t_str = f"{uc['team_emoji']} {uc['team_name']}" if uc['team_name'] else ""
+            text += f"ID `{uc['id']}` | **{uc['nickname']}** ({uc['position']}, {uc['ovr']} OVR) — `x{uc['count']}` [{uc['rarity']}] {t_str}\n"
+
+    if len(text) > 4000:
+        parts = [text[i:i+3800] for i in range(0, len(text), 3800)]
+        for p in parts:
+            await update.message.reply_text(p, parse_mode="Markdown")
+        await update.message.reply_text("⚙️ Админ-панель:", reply_markup=admin_menu_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+
     return ConversationHandler.END
 
 async def admin_show_players_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2597,12 +3093,27 @@ async def admin_show_players_list(update: Update, context: ContextTypes.DEFAULT_
     users = c.fetchall()
     conn.close()
 
-    text = f"👥 Всего игроков: {len(users)}\n\n"
-    for u in users[:30]:
-        text += f"• @{u['username'] or u['first_name']} (`{u['user_id']}`) | {u['balance']} RPL | {u['mmr']} MMR\n"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+    if not users:
+        await update.message.reply_text("📭 В боте пока нет зарегистрированных игроков.", reply_markup=admin_menu_keyboard())
+        return
 
-# ---------- СТАРТ И ОБРАБОТЧИКИ ----------
+    text = f"👥 **Список игроков, которые играли в бота (Всего: {len(users)}):**\n\n"
+    lines = []
+    for u in users:
+        uname = f"@{u['username']}" if u['username'] else u['first_name'] or "Без имени"
+        lines.append(f"• {uname} (`{u['user_id']}`) | 💳 `{u['balance']} RPLCoin` | 🏆 `{u['mmr']} MMR`")
+
+    msg_chunk = text
+    for line in lines:
+        if len(msg_chunk) + len(line) + 1 > 3800:
+            await update.message.reply_text(msg_chunk, parse_mode="Markdown")
+            msg_chunk = ""
+        msg_chunk += line + "\n"
+
+    if msg_chunk:
+        await update.message.reply_text(msg_chunk, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+
+# ---------- ОСТАЛЬНЫЕ ФУНКЦИИ БОТА ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     get_or_create_user(user.id, user.username, user.first_name)
@@ -2620,6 +3131,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
+        await update.message.reply_text("Команда только в личных сообщениях.")
         return ConversationHandler.END
     if is_admin(update.effective_user.id):
         await update.message.reply_text("Вы уже авторизованы.", reply_markup=admin_menu_keyboard())
@@ -2633,13 +3145,16 @@ async def wait_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_PASSWORD
 
 async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if check_credentials(context.user_data.get("login"), update.message.text):
+    login = context.user_data.get("login")
+    password = update.message.text
+    if check_credentials(login, password):
         add_admin(update.effective_user.id)
         context.user_data.clear()
         await update.message.reply_text("✅ Авторизован!", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
-    await update.message.reply_text("❌ Неверный пароль!")
-    return ConversationHandler.END
+    else:
+        await update.message.reply_text("❌ Неверный логин или пароль!")
+        return ConversationHandler.END
 
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -2650,48 +3165,43 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if text == "➕ Добавить каналы":
-        await update.message.reply_text("Введите @username канала:")
+        await update.message.reply_text("Введите @username канала (бот должен быть админом):")
         return WAITING_CHANNEL_USERNAME
     elif text == "➕ Добавить чаты":
-        await update.message.reply_text("Введите ID чата:")
+        await update.message.reply_text("Введите числовой ID чата или @username:")
         return WAITING_CHAT_LINK
     elif text == "📩 Проверить поддержку":
-        messages = get_unanswered_messages()
-        if not messages:
-            await update.message.reply_text("📭 Новых обращений нет.", reply_markup=admin_menu_keyboard())
-            return
-        msg = messages[0]
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Закрыть", callback_data=f"close_{msg['id']}")]])
-        await update.message.reply_text(f"📩 #{msg['id']} от @{msg['username']}:\n\n{msg['text']}", reply_markup=kb)
+        await show_support_messages(update, context)
         return
     elif text == "⚙️ Настройки":
-        await update.message.reply_text("⚙️ Настройки активны.", reply_markup=admin_menu_keyboard())
+        await show_settings(update, context)
         return
     elif text == "🎮 Настройки игры":
-        await update.message.reply_text("🎮 Настройки матчей активны.", reply_markup=admin_menu_keyboard())
-        return
+        await show_game_settings(update, context)
+        return ConversationHandler.END
     elif text == "🃏 Карточки":
-        await update.message.reply_text("🃏 Меню карточек:", reply_markup=card_admin_keyboard())
+        await update.message.reply_text("🃏 **Раздел управления карточками:**", reply_markup=card_admin_keyboard(), parse_mode="Markdown")
         return CARD_ADMIN_MENU
-    elif text == "🎟 Создать промокод":
-        return await start_create_promo(update, context)
     elif text == "🔍 Инвентарь игрока":
-        await update.message.reply_text("🔍 Введите ID или username игрока:")
+        await update.message.reply_text("🔍 Введите @username или ID игрока:")
         return WAITING_VIEW_USER_INV
     elif text == "👥 Список игроков":
         await admin_show_players_list(update, context)
-        return
+        return ConversationHandler.END
     elif text == "🚪 Выйти":
         remove_admin(user_id)
-        await update.message.reply_text("🚪 Выход выполнен.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("🚪 Вы вышли из админ-панели.", reply_markup=main_menu_keyboard())
         return
+    return ConversationHandler.END
 
 async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.strip()
+    if not username.startswith('@'):
+        username = '@' + username
     try:
-        chat = await context.bot.get_chat(username if username.startswith('@') else '@' + username)
+        chat = await context.bot.get_chat(username)
         add_source_channel(chat.id, username, update.effective_user.id)
-        await update.message.reply_text("✅ Канал добавлен.", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text(f"✅ Канал {username} добавлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
     return ConversationHandler.END
@@ -2701,10 +3211,37 @@ async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat = await context.bot.get_chat(link)
         add_target_chat(chat.id, link, update.effective_user.id)
-        await update.message.reply_text("✅ Чат добавлен.", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text(f"✅ Чат {link} добавлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
     return ConversationHandler.END
+
+async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    messages = get_unanswered_messages()
+    if not messages:
+        await update.message.reply_text("📭 Новых обращений нет.", reply_markup=admin_menu_keyboard())
+        return
+    msg = messages[0]
+    display_text = f"📩 Обращение #{msg['id']}\n👤 {msg['username'] or msg['user_id']}\n🕒 {msg['timestamp']}\n\n{msg['text']}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{msg['id']}")],
+        [InlineKeyboardButton("✅ Закрыть", callback_data=f"close_{msg['id']}")]
+    ])
+    await update.message.reply_text(display_text, reply_markup=keyboard)
+
+async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sources = get_source_channels()
+    targets = get_target_chats()
+    text = "📋 **Настройки**\n\n📢 **Каналы-источники:**\n"
+    for s in sources:
+        text += f" - {s['username'] or s['chat_id']}\n"
+    text += "\n📥 **Целевые чаты:**\n"
+    for t in targets:
+        text += f" - {t['link'] or t['chat_id']}\n"
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+
+async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎮 Настройки дуэли буллитов настроены.", reply_markup=admin_menu_keyboard())
 
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_pm_registered(update, context):
@@ -2748,59 +3285,80 @@ def main():
     app.add_handler(CommandHandler("getid", getid_command))
 
     # Авторизация админа
-    app.add_handler(ConversationHandler(
+    conv_auth = ConversationHandler(
         entry_points=[CommandHandler("adminkarpl", adminkarpl)],
         states={
             WAITING_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_login)],
             WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_password)],
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-    ))
+    )
+    app.add_handler(conv_auth)
 
-    # Создание промокода (Админка)
-    app.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🎟 Создать промокод$") & filters.ChatType.PRIVATE, admin_buttons)],
-        states={
-            ADD_PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_code)],
-            ADD_PROMO_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_type)],
-            ADD_PROMO_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_reward)],
-            ADD_PROMO_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_save_all)],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-    ))
-
-    app.add_handler(ConversationHandler(
+    conv_channel = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить каналы$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_CHANNEL_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_username)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-    ))
+    )
+    app.add_handler(conv_channel)
 
-    app.add_handler(ConversationHandler(
+    conv_chat = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить чаты$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_CHAT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_chat_link)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-    ))
+    )
+    app.add_handler(conv_chat)
 
-    app.add_handler(ConversationHandler(
+    conv_user_inv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔍 Инвентарь игрока$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={WAITING_VIEW_USER_INV: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_view_inventory_execute)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-    ))
+    )
+    app.add_handler(conv_user_inv)
 
-    app.add_handler(ConversationHandler(
+    conv_support = ConversationHandler(
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^support$")],
         states={WAITING_SUPPORT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-    ))
+    )
+    app.add_handler(conv_support)
 
-    app.add_handler(ConversationHandler(
+    conv_duel = ConversationHandler(
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^duel$")],
         states={WAITING_DUEL_SHOT: [CallbackQueryHandler(duel_shot, pattern="^shot_")]},
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-    ))
+    )
+    app.add_handler(conv_duel)
 
-    # Управление карточками в админке
-    app.add_handler(ConversationHandler(
+    # Раздел промокода (для игроков)
+    conv_promo_user = ConversationHandler(
+        entry_points=[
+            CommandHandler("promo", promo_command),
+            MessageHandler(filters.Regex("^🎁 Промокод$"), promo_command)
+        ],
+        states={WAITING_PROMO_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_input_receive)]},
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+    )
+    app.add_handler(conv_promo_user)
+
+    # Цена лота для рынка
+    conv_market_price = ConversationHandler(
+        entry_points=[CallbackQueryHandler(market_callback_handler, pattern="^select_mcard_")],
+        states={WAITING_MARKET_PRICE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, execute_market_list_price)]},
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+    )
+    app.add_handler(conv_market_price)
+
+    # Деньги в трейде
+    conv_trade_money = ConversationHandler(
+        entry_points=[CallbackQueryHandler(trade_callback_handler, pattern="^tr_addmoney_")],
+        states={WAITING_TRADE_MONEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, execute_trade_money_input)]},
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+    )
+    app.add_handler(conv_trade_money)
+
+    # Админ создание карточек и промокодов
+    conv_cards = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🃏 Карточки$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
             CARD_ADMIN_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_card_menu_handler)],
@@ -2825,14 +3383,19 @@ def main():
             ADD_PACK_PHOTO: [MessageHandler(filters.PHOTO, pack_save_all)],
             GRANT_CARD_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, grant_card_execute)],
             GIVE_MONEY_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, give_money_execute)],
+            ADD_PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_code)],
+            ADD_PROMO_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_type)],
+            ADD_PROMO_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_set_val)],
+            ADD_PROMO_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_promo_save)],
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
         allow_reentry=True,
-    ))
+    )
+    app.add_handler(conv_cards)
 
     app.add_handler(MessageHandler(filters.Regex("^(📩 Проверить поддержку|⚙️ Настройки|🎮 Настройки игры|👥 Список игроков|🚪 Выйти)$") & filters.ChatType.PRIVATE, admin_buttons))
 
-    # Команды бота
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("rplcards", rplcards_command))
     app.add_handler(CommandHandler("inventory", inventory_command))
@@ -2840,32 +3403,30 @@ def main():
     app.add_handler(CommandHandler("cardmatch", cardmatch_command))
     app.add_handler(CommandHandler("cardmmr", cardmmr_command))
     app.add_handler(CommandHandler("shop", shop_command))
-    app.add_handler(CommandHandler("trade", trade_command))
     app.add_handler(CommandHandler("cardshop", cardshop_command))
-    app.add_handler(CommandHandler("promo", promo_command))
+    app.add_handler(CommandHandler("trade", trade_command))
 
-    # Кнопки клавиатуры
+    # Текстовое меню
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$"), main_menu))
+    app.add_handler(MessageHandler(filters.Regex("^🃏 Бесплатная карта$"), rplcards_command))
     app.add_handler(MessageHandler(filters.Regex("^🎒 Инвентарь$"), inventory_command))
+    app.add_handler(MessageHandler(filters.Regex("^🛒 Торговая площадка$"), cardshop_command))
     app.add_handler(MessageHandler(filters.Regex("^🏒 Состав и Профиль$"), profile_command))
     app.add_handler(MessageHandler(filters.Regex("^⚔️ Искать игру$"), cardmatch_command))
     app.add_handler(MessageHandler(filters.Regex("^🛒 Магазин Паков$"), shop_command))
-    app.add_handler(MessageHandler(filters.Regex("^🎴 Бесплатная карта$"), rplcards_command))
-    app.add_handler(MessageHandler(filters.Regex("^🔄 Трейд$"), lambda u,c: u.message.reply_text("🤝 Введите `/trade @username ID [деньги]` в чат для обмена.", parse_mode="Markdown")))
-    app.add_handler(MessageHandler(filters.Regex("^🛍 Торговая площадка$"), cardshop_command))
-    app.add_handler(MessageHandler(filters.Regex("^🎟 Промокод$"), lambda u,c: u.message.reply_text("🎟 Введите `/promo <код>` для активации промокода.", parse_mode="Markdown")))
     app.add_handler(MessageHandler(filters.Regex("^🏆 Топ MMR$"), cardmmr_command))
+    app.add_handler(MessageHandler(filters.Regex("^🤝 Трейд$"), trade_command))
 
-    # Callbacks
+    # Callback Handlers
     app.add_handler(CallbackQueryHandler(inventory_callback_handler, pattern="^(refresh_inv|craft_leg_|sell_menu|do_sell_)"))
+    app.add_handler(CallbackQueryHandler(market_callback_handler, pattern="^(refresh_market|my_market_items|market_list_menu|cancel_market_|buy_market_)"))
+    app.add_handler(CallbackQueryHandler(trade_callback_handler, pattern="^(accept_trade_|decline_trade_|tr_)"))
     app.add_handler(CallbackQueryHandler(profile_callback_handler, pattern="^(refresh_profile|edit_roster_menu|set_pos_|apply_card_)"))
     app.add_handler(CallbackQueryHandler(match_callback_handler, pattern="^(accept_match_|cancel_match_)"))
-    app.add_handler(CallbackQueryHandler(shop_callback_handler, pattern="^(buy_pack_|preview_pack_|shop_back)"))
-    app.add_handler(CallbackQueryHandler(trade_callback_handler, pattern="^trade_(accept|decline)_"))
-    app.add_handler(CallbackQueryHandler(cardshop_callback_handler, pattern="^(buy_shop_|refresh_cardshop)"))
+    app.add_handler(CallbackQueryHandler(shop_callback_handler, pattern="^(preview_pack_|confirm_pack_|cancel_pack_buy)"))
     app.add_handler(CallbackQueryHandler(inline_callback))
 
-    logger.info("Бот RPL с обновлениями успешно запущен...")
+    logger.info("Бот RPL успешно запущен...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
